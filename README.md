@@ -1186,3 +1186,4 @@ All URLs verified against the `main` branch / `latest` docs during this investig
 - `StreamOperatorParameters` (1.20 — `getMailboxExecutor()`): https://nightlies.apache.org/flink/flink-docs-release-1.20/api/java/org/apache/flink/streaming/api/operators/StreamOperatorParameters.html
 
 > **Note on source stability:** SlateDB source/docs links point to the `main` branch and docs.rs `latest`; they reflect HEAD at time of writing and may drift. For a build-stable reference, pin SlateDB source to the **`v0.14.1`** git tag and use versioned docs.rs (`/slatedb/0.14.1/...`). Flink links are pinned to release-1.20 / release-2.3 except the stateful-stream-processing concept page (master), whose barrier semantics are stable across these versions.
+
