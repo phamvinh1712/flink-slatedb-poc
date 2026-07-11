@@ -11,15 +11,7 @@ building and running 9 tests. Findings that only surfaced by running are marked 
 
 ---
 
-## Phase 0 — Warmup / adjacent questions
-
-**Q: "hi"**
-Greeting.
-
-**Q: "is it possible to make flink read iceberg in order"**
-Discussion: No global total order from a parallel read. Options — parallelism=1, sort-on-write (per-file
-order), or streaming with `watermark-column` + ordered split assigner for approximate event-time order.
-Practical pattern: order per key or near-order by time.
+## Phase 0 — Warmup: SlateDB vs RocksDB
 
 **Q: "what do you think of slatedb versus rocksdb"**
 Discussion: Not feature-for-feature — it's **local-disk (RocksDB, µs) vs disaggregated object-storage
