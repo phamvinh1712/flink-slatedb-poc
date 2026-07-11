@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.slatedb.flink.poc</groupId>
+  <artifactId>flink-slatedb-e2e</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <!--
+    THE END-TO-END TEST — the composition the rest of the PoC did NOT exercise:
+    a REAL Flink KeyedProcessFunction (on a MiniCluster) using SlateDB as its per-key state store,
+    in ONE JVM, then exactly-once restore via clone-from-checkpoint on the Flink-produced state.
+
+    Verifies together (previously only verified in isolation):
+      §6.1  key-group-prefixed keys in one SlateDB keyspace
+      §6.2  blocking get/put per key inside a real keyed operator (single-threaded-per-key correctness)
+      §6.3  snapshotState = MEMTABLE flush + createDetachedCheckpoint (the §16.2 fix)
+      §6.6  restore = clone-from-pinned-checkpoint (NOT writer reopen) → post-barrier writes discarded
+      §16.3 Flink + SlateDB coexisting in one JDK-22+ JVM
+
+    Requires JDK 22+ (SlateDB FFM floor). Flink 1.20.1 runs fine on JDK 25 (verified §16.3).
+    Uses a FILE-based object store so SlateDB state is external/persistent (like S3), and the clone
+    reads the parent from that path.
+  -->
+
+  <properties>
+    <maven.compiler.release>23</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <flink.version>1.20.1</flink.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-streaming-java</artifactId>
+      <version>${flink.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-clients</artifactId>
+      <version>${flink.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.slatedb</groupId>
+      <artifactId>slatedb-uniffi</artifactId>
+      <version>0.14.1</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>1.7.36</version>
+    </dependency>
+  </dependencies>
+</project>
