@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.slatedb.flink.poc</groupId>
+  <artifactId>slatedb-verify</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <!--
+    Standalone SlateDB correctness verifier — NO Flink dependency.
+    Verifies the load-bearing SlateDB behavior the design doc depends on:
+      §12.8 / §6.6  clone-from-checkpoint EXCLUDES post-checkpoint writes (exactly-once restore).
+
+    ⚠️ REQUIRES JDK 22+. The slatedb-uniffi artifact is compiled to Java 22 (class version 66) and
+    uses the java.lang.foreign / FFM API. This is why it lives in its OWN module: a JDK 11/17 javac
+    cannot even READ these class files ("wrong version 66.0"), so it cannot coexist with the
+    Flink 1.20 (Java 11) / Flink 2.3 (Java 17) projects. That incompatibility is itself a design
+    finding (added to the doc): the SlateDB binding's JVM floor (22) is above Flink's supported JVMs.
+  -->
+
+  <properties>
+    <maven.compiler.release>22</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.slatedb</groupId>
+      <artifactId>slatedb-uniffi</artifactId>
+      <version>0.14.1</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.1.0</version>
+        <configuration>
+          <mainClass>io.slatedb.flink.poc.SlateDbCloneRestoreMain</mainClass>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
