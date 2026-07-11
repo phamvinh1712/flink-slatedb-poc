@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.slatedb.flink.poc</groupId>
+  <artifactId>flink-1.20-poc</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <!--
+    Verifies the FLINK 1.20 -side claims of the SlateDB-in-Flink design doc:
+      §3   KeyGroupRange reconstruction from RuntimeContext (deterministic key routing)
+      §0   open(Configuration) signature; RuntimeContext parallelism getters PRESENT (deprecated)
+      §13.7 State TTL has NO expiration callback (only cleanup strategies)
+      §13.4 onTimer / processElement fire on keyed state (timers work)
+    Runs on an embedded Flink MiniCluster — no cluster, no Docker.
+    NOTE: SlateDB itself is NOT on the classpath here (its JAR needs Java 22 FFM;
+    this project targets Java 11). SlateDB behaviors are verified separately.
+  -->
+
+  <properties>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <flink.version>1.20.1</flink.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-streaming-java</artifactId>
+      <version>${flink.version}</version>
+    </dependency>
+    <!-- flink-clients pulls in the MiniCluster for local execute()/executeAndCollect() -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-clients</artifactId>
+      <version>${flink.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>1.7.36</version>
+    </dependency>
+
+    <!--
+      NOTE: SlateDB is intentionally NOT a dependency of this project. The slatedb-uniffi artifact
+      is compiled to Java 22 (class version 66); a JDK 11 javac cannot even read those class files
+      ("wrong version 66.0, should be 55.0"). SlateDB verification lives in the separate
+      ../slatedb-verify module (JDK 22+). This project verifies only the Flink-1.20-side design claims.
+    -->
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.1.0</version>
+        <configuration>
+          <mainClass>io.slatedb.flink.poc.FlinkKeyedStatePoc</mainClass>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

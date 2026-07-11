@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.slatedb.flink.poc</groupId>
+  <artifactId>flink-2.3-poc</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <!--
+    Verifies the FLINK 2.3 -side claims of the SlateDB-in-Flink design doc:
+      §0/§3 getTaskInfo() is the ONLY parallelism path (direct RuntimeContext getters REMOVED in 2.x)
+      §3    KeyGroupRange reconstruction still works (same as 1.20)
+      §0    Async state API EXISTS: KeyedStream.enableAsyncState(), state.v2.ValueState.asyncValue()/asyncUpdate()
+            returning StateFuture — this is the 2.x-only capability that makes ForSt/disaggregated state viable,
+            and the reason the DIY SlateDB path is 2.3's less-preferred option (§0.1, §15.2).
+    Runs on an embedded MiniCluster — no cluster, no Docker.
+    SlateDB is included as a Maven dep (proving it resolves) but NOT executed here (needs JDK22 FFM; 2.3 runs Java17).
+  -->
+
+  <properties>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <flink.version>2.3.0</flink.version>
+  </properties>
+
+  <dependencies>
+    <!-- In Flink 2.x, DataStream API + operators live in flink-streaming-java (which pulls flink-runtime). -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-streaming-java</artifactId>
+      <version>${flink.version}</version>
+    </dependency>
+    <!-- flink-core-api carries the v2 async state API: state.v2.ValueState, StateFuture. -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-core-api</artifactId>
+      <version>${flink.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-clients</artifactId>
+      <version>${flink.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>1.7.36</version>
+    </dependency>
+
+    <!--
+      NOTE: SlateDB is intentionally NOT a dependency here. slatedb-uniffi is compiled to Java 22
+      (class version 66); a JDK 17 javac cannot read those class files. SlateDB verification lives
+      in the separate ../slatedb-verify module (JDK 22+). This project verifies the Flink-2.3-side claims.
+    -->
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.1.0</version>
+        <configuration>
+          <mainClass>io.slatedb.flink.poc.Flink23AsyncStatePoc</mainClass>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
