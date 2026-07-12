@@ -101,6 +101,8 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      HYBRID TIERING E2E PASSED ✅  (§13 RocksDB-hot + SlateDB-cold: demote/promote/hot-wins)
                      COMPACTION E2E PASSED ✅  (§7 compactor merges L0→sorted-runs, drains L0, no data loss)
                      PARALLEL SHARD-PER-BUCKET E2E PASSED ✅  (§4/§4.1/§12.7 P=4, 16 shards, shared cache, exact)
+                     GC E2E PASSED ✅  (§7/§16.13 compaction orphans files; compactor 900s checkpoint pins them; GC retains, no loss)
+                     LONG GC E2E PASSED ✅  (§16.13 ~17min: orphans physically deleted at t+900s; 15→4 files; no loss)
 slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 real ops + checkpoint on JDK 11, 17, AND 25 — no FFM, no flags)
 ```
 
@@ -684,6 +686,14 @@ max_open_file_handles: 1000,
   2. **Contends with what Flink needs disk for** — especially in the hybrid design (§13) where RocksDB *is* the hot tier: RocksDB SSTs, local checkpoint dir, `io.tmp.dirs`. Shared volume → contention for **space and IOPS**; a full disk can crash the TM or fail RocksDB flushes.
   3. **Cap is soft** — eviction is driven by a directory rescan every `scan_interval` (1 h default); on-disk usage can drift above the cap between scans. Budget headroom / shorten `scan_interval` if disk-tight.
 
+### Object-storage space reclaim lags compaction by ~15 min (⚡ verified, §16.13)
+Distinct from local disk: this is your **object-store** footprint. Compaction rewrites the manifest to drop old
+SSTs but does not delete the files; a background GC (on by default) deletes orphans later. **Verified by running:
+physical deletion is gated by a hardcoded 900s (15-min) compactor checkpoint, NOT by `min_age`** — the compactor
+pins each just-compacted generation for 15 min so it can't be deleted "out from underneath the writer." So
+steady-state object-store usage ≈ live state **+ ~15 min of post-compaction orphans** (plus WAL). Budget for it;
+the 900s window is not tunable from the Java binding. Details and the runnable proof: §16.13.
+
 ### Recommendations
 - **Default posture: leave the disk cache OFF.** The in-memory block cache (§9, foyer, on by default) already absorbs hot reads. Enable disk cache only if cold-read S3 latency/cost is a *measured* problem.
 - **If enabled:** set `max_cache_size_bytes` explicitly; place `root_folder` on a **separate volume** from RocksDB and Flink tmp/checkpoint dirs.
@@ -1011,8 +1021,10 @@ Assuming you build on Flink's async state framework (2.0+/ForSt-style), the Slat
 
 Everything above §16 was verified by *reading* shipped source. This section records what was verified by
 *running* code against the real published artifact (`io.slatedb:slatedb-uniffi:0.14.1` from Maven Central)
-and real Flink (1.20.1, 2.3.0) on embedded MiniClusters. PoC lives in `flink-slatedb-poc/` (3 Maven modules,
-no Docker). **Running surfaced two findings that source-reading missed** — including a silent-data-loss bug.
+and real Flink (1.20.1, 2.3.0) on embedded MiniClusters. PoC lives in `flink-slatedb-poc/` (5 Maven modules,
+no Docker). **Running repeatedly surfaced findings that source-reading missed** — a silent-data-loss bug
+(§16.2), that Flink runs on JDK 25 (§16.3), the removable Java-22 floor (§17), and that post-compaction space
+reclaim lags ~15 min behind `min_age` (§16.13). See the ⚡ list in `INVESTIGATION-JOURNAL.md`.
 
 ### 16.1 Results
 | Module | What ran | Result |
@@ -1102,6 +1114,27 @@ Forced many small L0 SSTs (`l0_sst_size_bytes=4096`, 20 memtable flushes) with a
 keys intact** afterward (no loss/corruption across compaction). Verifies §7 compaction runs and preserves data.
 API finding: `Settings.set(key, valueJson)` takes **JSON values** — numbers bare (`"4096"`), durations as
 quoted strings (`"\"200ms\""`), not JSON maps.
+
+### 16.13 ⚡ GARBAGE COLLECTION: orphans are physically deleted, but ~15 min AFTER compaction (`SlateDbGcE2E` / `SlateDbGcLongE2E`)
+**A "found by running" correction to a design assumption.** Compaction rewrites the manifest to drop old SSTs
+but does **not** delete the files — a background GC does, gated by (a) `min_age`, (b) the compaction
+low-watermark, and (c) *not referenced by the latest manifest or any live checkpoint*. I assumed a small
+`min_age` ⇒ prompt deletion. **Wrong.** Setting `min_age=1s` and idling, GC deleted **nothing** for many
+minutes. Instrumenting SlateDB's own DEBUG logs + reading the manifest showed why: on **every manifest commit
+the compactor first writes an internal checkpoint with a hardcoded 900s (15-minute) expiry** —
+`compactor_state_protocols.rs:250`, *"so that it's extremely unlikely for the gc to delete ssts out from
+underneath the writer."* That checkpoint pins the manifests referencing the just-compacted L0s, so condition
+(c) stays false for ~15 min **regardless of `min_age`**.
+- `SlateDbGcE2E` (fast, ~3 min) — ✅ verifies the STATE that explains the delay, live: compaction orphaned
+  files (**54 on disk vs 5–8 manifest-referenced**), the compactor auto-created **12 checkpoints with
+  `lifetimeSecs=900`**, and GC conservatively **retained** the orphans within the window; 2000 keys intact.
+- `SlateDbGcLongE2E` (~17 min) — ✅ waits out the 900s expiry and observes the physical deletion: on-disk
+  compacted files **15 → 7 at t+900s → 4 at t+930s** (11 SSTs deleted, logged), settling at the live set; all
+  data intact. Deletion fires *exactly* at the checkpoint expiry, not before.
+- **Implication for Flink:** steady-state disk holds live state **+ ~15 min of post-compaction orphans**; the
+  900s window is **not tunable** from the Java binding (hardcoded; source has a TODO to make it configurable).
+  It is safe/correct (deliberately conservative), just slower to reclaim than `min_age` suggests. Relevant to
+  §9A disk sizing.
 
 ### 16.12 PARALLEL + SHARD-PER-BUCKET + shared cache (`FlinkShardPerBucketParallelE2E`) — the P>1 gap
 The gap the other tests missed: a REAL Flink job at **parallelism=4** using shard-per-bucket. 16 fixed shards

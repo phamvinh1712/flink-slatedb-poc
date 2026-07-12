@@ -329,7 +329,38 @@ JDK 25) but *removable* — at the cost of maintaining a binding fork.
 
 ---
 
-## Final test scorecard (10 tests, all passing — laptop/MiniCluster only)
+## Phase 11 — Does SlateDB clean up orphan files after compaction?
+
+**Q: "does slatedb clean up orphan files after compaction?"**
+Discussion (source): compaction rewrites the manifest and leaves old SSTs as orphans; a background GC (on by
+default — `Settings::default` populates all dirs; 60s interval, 300s `min_age`) deletes them, gated by
+`min_age` + compaction low-watermark + *not referenced by latest manifest or any live checkpoint*. Then, to
+hold to the "verify by running" standard, I wrote `SlateDbGcE2E` to observe physical deletion.
+
+⚡ **Found by running — the design assumption was wrong.** With `min_age=1s` and a long idle, GC deleted
+**nothing**. I falsified four hypotheses in a row (low-watermark pinning, multi-round watermark advance,
+manifest "active" set, path-parse failure) by instrumenting with SlateDB's own DEBUG logs and decoding SST
+ULIDs vs the GC cutoff. The truth: **on every manifest commit the compactor writes an internal checkpoint with
+a hardcoded 900s (15-minute) expiry** (`compactor_state_protocols.rs:250`, *"so it's extremely unlikely for the
+gc to delete ssts out from underneath the writer"*). That checkpoint pins the manifests referencing the
+just-compacted L0s, so orphans survive **~15 min regardless of `min_age`.** Confirmed both directions:
+`SlateDbGcE2E` observed 54 files on disk / 5–8 referenced / **12 checkpoints with `lifetimeSecs=900`**, GC
+retaining; a 17-min run watched files drop **15 → 7 at t+900s → 4 at t+930s** (11 SSTs deleted), exactly at the
+expiry. Answer: **yes, but reclaim lags compaction by ~15 min, and it's not tunable from the Java binding.**
+Added `SlateDbGcE2E` (fast) + `SlateDbGcLongE2E` (~17 min) and README §16.13 / §9A.
+
+Also answered inline (source-verified, no new tests): **bloom filters** — yes, on by default (10 bits/key,
+`min_filter_keys=1000`), exposed in Java via `FilterPolicy`/`BloomFilterOptions`, plus a `PrefixExtractor` for
+prefix filters. **Foyer vs Moka** — both implement the in-memory *block* cache; **foyer** is default and has a
+hybrid memory+disk variant, **moka** is memory-only (Caffeine port); distinct from the object-store disk cache.
+**~1000 DBs in one Flink task** — the N/P trap: Tokio runtime is a process-wide singleton (threads don't
+scale), but per-DB native memory does (~1.1 GiB/DB at defaults ⇒ ~1.1 TiB for 1000 ⇒ OOM), plus 1000× logical
+compactor/GC/flusher tasks and S3 request load; mitigate with a shared block cache + few physical DBs holding
+many logical buckets. Not viable at defaults.
+
+---
+
+## Final test scorecard (12 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
 |---|---|---|
@@ -342,6 +373,8 @@ JDK 25) but *removable* — at the cost of maintaining a binding fork.
 | `FlinkHybridTieringE2E` | §13 RocksDB-hot + SlateDB-cold | ✅ |
 | `SlateDbCompactionE2E` | §7 compaction observed + no data loss | ✅ |
 | `FlinkShardPerBucketParallelE2E` | §4/§4.1/§12.7 P=4 shard-per-bucket, shared cache | ✅ |
+| `SlateDbGcE2E` | §7/§16.13 compaction orphans files; 900s compactor checkpoint pins them; GC retains | ✅ |
+| `SlateDbGcLongE2E` | §16.13 orphans physically deleted after 900s expiry (~17-min run) | ✅ |
 | `slatedb-jna-j11` | §17 Java-22 floor is removable — JNA binding, real ops + checkpoint on JDK 11/17/25 | ✅ |
 
 ## Bugs / corrections that only RUNNING surfaced (⚡)
@@ -356,11 +389,15 @@ JDK 25) but *removable* — at the cost of maintaining a binding fork.
 8. **The Java-22 floor is removable** — regenerating with UniFFI's Kotlin/JNA backend runs SlateDB on JDK
    11/17/25 (§17). Surfaced two fork costs by running: a uniffi-0.31 `message`-collision codegen bug (won't
    compile on any kotlinc) and mandatory binding↔native-lib version lockstep (`UnsatisfiedLinkError` otherwise).
+9. **Post-compaction space reclaim lags ~15 min, not `min_age`** (§16.13). GC deletes orphaned SSTs only after a
+   hardcoded **900s compactor checkpoint** expires (it pins the just-compacted generation). `min_age` is not the
+   gate; the 900s is not tunable from the Java binding. Proven by a 17-min run: files 15→4 exactly at t+900s.
 
 ## Still genuinely unverified (need real object storage + load, not a MiniCluster)
 
 - §8 L0 write-stall backpressure (never overwhelmed compaction).
-- §9/§9A memory footprint / silent OOM / no-spill / disk contention.
+- §9/§9A memory footprint / silent OOM / no-spill / disk contention. (Compaction GC / space-reclaim timing IS
+  now verified — §16.13 — but memory OOM and disk-cache contention remain unmeasured.)
 - §14 resharding (changing N).
 - Real parallel savepoint→rescale-across-restart (algorithm + parallel operation tested separately, not fused).
 - All §11 operational risks: S3 tail latency (p99/p999), request cost, pre-1.0 on-disk format stability,
