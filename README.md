@@ -417,6 +417,19 @@ Every non-`Db` type the design calls is confirmed present in the UniFFI/Java bin
 
 **Rescale-read path confirmed viable:** `DbReaderBuilder.withCheckpointId(cpId)` opens a source DB pinned to its checkpoint, and `DbReader.scan(range)` + `DbIterator.next()` drive the §6.4 merge loop. No missing primitive.
 
+### 5B. Bloom filters — yes, like RocksDB (default-on, tunable, exposed in Java)
+
+SlateDB writes **per-SST bloom filters**, same purpose as RocksDB's: on a point `get`, skip reading an SST's data blocks (and, on object storage, avoid a whole S3 GET) when the key is definitely absent. Verified against source (`slatedb/src/config.rs`, `filter_policy.rs`, binding `builder.rs`/`filter_policy.rs`):
+
+| Aspect | Value | Note |
+|---|---|---|
+| Default | **ON** | An SST gets a filter when it holds **≥ `min_filter_keys` = 1000** keys (`config.rs` default). Smaller SSTs skip it — a full scan is cheaper than a filter lookup there. |
+| Sizing | **10 bits/key** default | The default `FilterPolicy` is a single bloom filter at 10 bits/key (`builder.rs`) — comparable to RocksDB's default. Memory lands in the **128 MiB meta cache** (§9), off-heap. |
+| Java control | `DbBuilder.withFilterPolicies(List<FilterPolicy>)` | `FilterPolicy` + `BloomFilterOptions` are bound; tune bits/key or disable. Reader side must match the writer's `min_filter_keys` (there is a matching `ReaderOptions.min_filter_keys`). |
+| Prefix filters | `PrefixExtractor` (bound) | Beyond stock RocksDB: a prefix-bloom mode — useful if your Flink keys share a key-group byte prefix (§6.1), letting a `scan_prefix` skip SSTs by prefix. |
+
+**Why it matters more here than in RocksDB:** a RocksDB false-negative-avoidance saves a local disk read (µs); a SlateDB filter check saves an **object-store round-trip** (ms + request cost). So for point-lookup-heavy keyed state, the filter is doing proportionally more work. Nuance vs RocksDB: RocksDB can pin filter blocks separately in memory; SlateDB caches them in the meta cache (§9) — functionally equivalent for lookups, but subject to the same soft cache-eviction caveat.
+
 ---
 
 ## 6. Detailed Design: Keyed State Integration
@@ -617,7 +630,7 @@ The Java objects (`Db`, `WriteHandle`, returned `byte[]`) are thin FFM/Panama ha
 | Block cache (in-mem SST blocks) | **off-heap** | `DbCache.max_capacity` | **512 MiB** (`DEFAULT_BLOCK_CACHE_CAPACITY`) |
 | Metadata cache (indexes + bloom filters) | **off-heap** | split-cache meta capacity | **128 MiB** (`DEFAULT_META_CACHE_CAPACITY`) |
 | Unflushed buffers (memtable+WAL) | **off-heap** | `max_unflushed_bytes` | **1 GiB** |
-| Bloom filters | **off-heap** | `bits_per_key` | 10 bits/key |
+| Bloom filters (see §5B) | **off-heap** (in meta cache) | `bits_per_key` | 10 bits/key, default-on ≥1000 keys |
 | Scan read-ahead | **off-heap**, pinned during scan | `ScanOptions.read_ahead_size` | one block |
 | Object-store cache (optional) | **local disk** | `object_store_cache_options` | off; 16 GiB if enabled, 4 MiB parts |
 
@@ -630,6 +643,22 @@ per-DB native footprint (defaults):
   block 512 MiB + meta 128 MiB + unflushed 1024 MiB ≈ 1.66 GiB   ← YOUR CASE (cache ON, confirmed)
   unflushed 1024 MiB                               ≈ 1.0  GiB   (cache OFF — not applicable; would need withDbCacheDisabled())
 ```
+
+### 9.1a Foyer vs Moka — the two block-cache backends
+
+The "block cache" above (`DbCache`) has **two interchangeable implementations**, both compiled into the published JAR. They cache the same thing (decoded SST **blocks, index, and filters**, keyed by SST id) and implement the same `DbCache` trait — the choice is an operational trade-off, not a feature difference. ⚠️ Don't confuse this **in-memory block cache** with the **object-store disk cache** (§9A) — different layer.
+
+| | **Foyer** (`newFoyerCache`) | **Moka** (`newMokaCache`) |
+|---|---|---|
+| Default? | ✅ **Yes** — `default_db_cache()` is foyer-backed (core `default = ["aws","foyer"]`) | No — opt-in via `DbCache.newMokaCache(...)` |
+| Tiering | **Hybrid: memory + local disk** (`FoyerHybridCache` with a disk device) — can spill cached blocks to NVMe instead of evicting | **Memory only** |
+| Lineage | Rust-native, purpose-built for hybrid caching | Port of Java's Caffeine (W-TinyLFU eviction) |
+| Miss coalescing | dedup-aware `fetch` (concurrent misses for one key share a single load) | via the trait's default loader |
+
+**Which to pick for Flink:**
+- **Moka** — simplest, purely in-memory. Prefer it when you do **not** want SlateDB touching local disk (the §9A contention concern — e.g. a TaskManager where RocksDB is the hot tier in the §13 hybrid design). This is what `FlinkShardPerBucketParallelE2E` used (shared moka cache per subtask, §16.12).
+- **Foyer** — default; choose its **hybrid mode** when you want a large block cache that overflows to local NVMe rather than evicting hot blocks (trades §9A disk for fewer cold S3 reads). Adds a disk-space/IOPS cost — size it against everything else on that volume (§9A).
+- Either way the cache is **shareable across many DB instances** and collision-safe (§4.1, §12.7), which is what collapses the per-instance memory multiplier.
 
 ### 9.2 Which Flink memory section — NONE that Flink manages
 Flink TaskManager memory: `Total Process = JVM Heap + Managed Memory + Framework/Task Off-heap + Network + JVM Overhead + Metaspace`.
