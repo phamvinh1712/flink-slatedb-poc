@@ -14,11 +14,13 @@ All modules have been run and **PASS** on this machine (see "Results" below).
 | `flink-2.3-poc` | Flink **2.3** claims: §0 `open(OpenContext)`, getTaskInfo()-only, §0/§15.2 `enableAsyncState()` exists **and** is runtime-enforced | JDK 17 | JDK 17 (also 25) |
 | `slatedb-verify` | SlateDB **correctness**: §12.8/§6.6 clone-from-checkpoint exactly-once (excludes post-checkpoint writes, retains pre-checkpoint), and the **§6.3 memtable-flush finding** | **JDK 22+** only | **JDK 22+** only |
 | `flink-slatedb-e2e` | **THE compositions** (5 mains): real Flink `KeyedProcessFunction` + SlateDB in ONE JVM — clone-restore exactly-once, real checkpoint+failure+recovery, §6.4 rescale merge, §13 hybrid tiering, §7 compaction, and §4/§4.1/§12.7 parallel shard-per-bucket (P=4) | **JDK 22+** | **JDK 22+** (Flink on JDK 25) |
+| `slatedb-jna-j11` | §17: the Java-22 floor is a **packaging** choice — the SlateDB native lib runs on **JDK 11/17/25** via a regenerated **Kotlin/JNA** binding (real put/get + MEMTABLE flush + detached checkpoint) | JDK 11 | **JDK 11, 17, 25** |
 
-`slatedb-verify` is a **separate module by necessity**: `io.slatedb:slatedb-uniffi:0.14.1` is compiled to
-Java 22 (class version 66, FFM API). A JDK 11/17 `javac` cannot even *read* those class files
-(`wrong version 66.0`), so it cannot live in the Flink 1.20/2.3 projects. SlateDB is pulled from
-Maven Central as a normal dependency (no manual JAR).
+`slatedb-verify` and `flink-slatedb-e2e` require **JDK 22+ by necessity**: `io.slatedb:slatedb-uniffi:0.14.1`
+is compiled to Java 22 (class version 66, **FFM** API). A JDK 11/17 `javac` cannot even *read* those class
+files (`wrong version 66.0`), so they cannot live in the Flink 1.20/2.3 projects. SlateDB is pulled from
+Maven Central as a normal dependency (no manual JAR). **That floor is not fundamental** — the `slatedb-jna-j11`
+module reaches the *same native library* through a **JNA** front-end and runs on JDK 11 (see §17).
 
 ## Prerequisites
 
@@ -72,6 +74,21 @@ export JAVA_HOME=~/.sdkman/candidates/java/25.0.3-tem
   -cp "target/classes:$(cat cp.txt)" io.slatedb.flink.poc.<MainClass>
 ```
 
+### 4. SlateDB on JDK 11 via the JNA binding (§17)
+Proof the Java-22 floor is removable. Uses the Kotlin/JNA binding checked into `slatedb-jna-j11`; reuses the
+same published native lib (no Rust toolchain to run). Runs unchanged on JDK **11, 17, and 25**:
+```bash
+cd slatedb-jna-j11
+mkdir -p native && (cd native && unzip -oj \
+  ~/.m2/repository/io/slatedb/slatedb-uniffi/0.14.1/slatedb-uniffi-0.14.1.jar \
+  'darwin-aarch64/libslatedb_uniffi.dylib')   # linux: linux-x86-64/libslatedb_uniffi.so
+export JAVA_HOME=~/.sdkman/candidates/java/11.0.26-tem   # or 17.0.15-tem, 25.0.3-tem
+mvn -q clean compile
+mvn -q exec:java -Djna.library.path="$PWD/native"
+# → RESULT: PASS — SlateDB (JNA binding) ran real ops + checkpoint on Java 11.0.26
+```
+(No `--enable-native-access` / `--add-opens` — those are FFM-only; JNA needs neither.)
+
 ## Results (verified on this machine)
 
 ```
@@ -84,6 +101,7 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      HYBRID TIERING E2E PASSED ✅  (§13 RocksDB-hot + SlateDB-cold: demote/promote/hot-wins)
                      COMPACTION E2E PASSED ✅  (§7 compactor merges L0→sorted-runs, drains L0, no data loss)
                      PARALLEL SHARD-PER-BUCKET E2E PASSED ✅  (§4/§4.1/§12.7 P=4, 16 shards, shared cache, exact)
+slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 real ops + checkpoint on JDK 11, 17, AND 25 — no FFM, no flags)
 ```
 
 Untested (need real infra/load, not a MiniCluster): §8 L0 write-stall backpressure, §9/§9A memory-OOM/disk,
@@ -1021,6 +1039,8 @@ surmountable**. Verified: Flink **1.20.1 AND 2.3.0 both run on JDK 25** (MiniClu
 `--add-opens java.base/{util,lang,time}=ALL-UNNAMED`, and SlateDB's native lib loads on the same JVM. So
 **in-process SlateDB + Flink IS possible** — run the whole cluster on JDK 22+. Caveat: officially unsupported
 by Flink; validate under real load. (Earlier drafts called this a showstopper based on stock-image JVMs — corrected.)
+**And the floor itself is removable — see §17:** regenerating the binding with UniFFI's Kotlin/JNA backend
+runs SlateDB on **JDK 11/17/25** (proven by `slatedb-jna-j11`), at the cost of maintaining a binding fork.
 
 ### 16.4 Confirmed empirically
 - §12.8 clone-from-checkpoint excludes post-checkpoint writes AND retains pre-checkpoint data (exactly-once sound, given §16.2 memtable flush).
@@ -1110,6 +1130,82 @@ hot-wins)` counts exact** for every key across demote→promote→re-demote cycl
 
 ### 16.7 One more API finding (from running it)
 `ObjectStore.resolve` **requires an empty path**: the store is the *root* (`file:///`, `s3://bucket`), and the DB path goes to the *builder* as the db-name. `resolve("file:///tmp/x")` fails with *"invalid object store path. provide path to builder instead."* Verified against the JAR. (So `new DbBuilder(dbPath, ObjectStore.resolve(rootUri))`, not a path-bearing store URI.)
+
+---
+
+## 17. The Java-22 floor is a PACKAGING choice, not a SlateDB limit (`slatedb-jna-j11`)
+
+§16.3 established that Flink runs on JDK 22+, so the FFM binding's Java-22 floor is *tolerable*. This section
+goes further and shows the floor is **removable**: the same SlateDB native library runs on **JDK 11, 17, and
+25** through a different generated front-end. Proven by the `slatedb-jna-j11` module (real ops + checkpoint,
+all three JVMs green).
+
+### 17.1 Where the floor actually comes from
+The published `io.slatedb:slatedb-uniffi` artifact is 100% machine-generated by
+[`uniffi-bindgen-java`](https://github.com/IronCoreLabs/uniffi-bindgen-java) (0.4.1, pinned in the repo). That
+generator emits **`java.lang.foreign` / FFM (Panama)** code. Verified by decompiling the published 0.14.1 JAR:
+
+- bytecode **major version 66** (Java 22) on every class;
+- **40** classes reference `java.lang.foreign.*` — `Linker.nativeLinker()`, `SymbolLookup.loaderLookup()`,
+  `downcallHandle`, `upcallStub`, **`Arena`** (a *final*-API type; the Java-17 incubator used the incompatible
+  `MemorySession`/`CLinker`), one `MethodHandle` per Rust fn;
+- **zero** generated classes call `com.sun.jna.*`.
+
+So the floor is JEP 454 (FFM finalized in **Java 22**), inherited entirely from the generator — not from the
+Rust core or the native lib. (Note: the 0.14.1 POM *does* declare a `net.java.dev.jna` dependency, but it's
+used only for platform detection / native-lib extraction; the actual FFI is all FFM. Don't be misled by it.)
+
+### 17.2 The removal path — regenerate with the Kotlin/JNA backend
+The native library exports a plain **C ABI** (441 symbols, generator-agnostic). UniFFI's Mozilla-standard
+**Kotlin** backend targets that same ABI via **JNA**, which runs on **Java 8+**. So you swap the *code
+generator*, touching neither Rust nor the native lib:
+
+```
+uniffi-bindgen 0.31.1  generate --language kotlin --library libslatedb_uniffi.dylib
+```
+
+The generated binding lives in package `uniffi.slatedb.*` (distinct from the FFM binding's
+`io.slatedb.uniffi.*`, so they never collide) — pure JNA (`Native.register`, `com.sun.jna.Callback`), 167
+`suspend` fns, no `java.lang.foreign`.
+
+### 17.3 Verified by RUNNING (`slatedb-jna-j11`)
+A plain-Java driver (compiled with `javac 11`) drives real SlateDB ops through the JNA binding:
+
+| JVM | 500× put/get | MEMTABLE flush | detached checkpoint | Result |
+|---|---|---|---|---|
+| **JDK 11** (Flink 1.20 floor) | 500/500 | ✅ | ✅ (real UUID) | **PASS** |
+| **JDK 17** | 500/500 | ✅ | ✅ | **PASS** |
+| **JDK 25** | 500/500 | ✅ | ✅ | **PASS** |
+
+No `--enable-native-access`, no `--add-opens` (those are FFM-only). The async completions genuinely exercise
+the JNA **upcall** path (`ffi_slatedb_uniffi_rust_future_poll_*` +
+`UniffiRustFutureContinuationCallback : com.sun.jna.Callback`) — the exact mechanism FFM does with
+`upcallStub`. The checkpoint is the async-heavy `Admin` op Flink needs for exactly-once.
+
+### 17.4 The "fork tax" — real, and hit during this work
+This is not free, and the costs are exactly what you'd own forever:
+
+1. **A genuine uniffi-0.31 codegen bug.** SlateDB's Rust `Error` variants carry a `message` field, so the
+   generator emits a constructor `val \`message\`` that **collides with `Throwable.message`** — it does **not
+   compile on any kotlinc** (tried 1.9.24 and 2.4). Had to patch 7 sites (`override val` + drop the redundant
+   getter). Every SlateDB/uniffi upgrade risks re-introducing this.
+2. **Version lockstep is mandatory.** Generating from clone `HEAD` (which had drifted past 0.14.1, adding
+   `admin_run_gc_once`) against the *published* 0.14.1 `.dylib` throws `UnsatisfiedLinkError: symbol not
+   found` at runtime. Fix: generate from the exact **`v0.14.1`** tag.
+3. **A Kotlin bridge is mandatory.** `suspend` fns surface as `(args, kotlin.coroutines.Continuation)` — not
+   ergonomically callable from Java. The FFM binding's clean `CompletableFuture` API is gone; you write
+   blocking wrappers (`slatedb-jna-j11`'s `SlateBridge.kt`).
+4. **You maintain a fork.** SlateDB publishes only the FFM artifact to Maven Central. Regenerate → re-patch →
+   recompile → re-test on every upgrade.
+5. **JNA marshalling overhead** per call vs FFM `MethodHandle` downcalls — likely negligible next to
+   object-storage latency, but real and unmeasured for this workload.
+
+### 17.5 Decision
+- **Can run Flink on JDK 22+** → use the official FFM binding as-is (what §16 tests use). Zero fork
+  maintenance, official artifact, clean `CompletableFuture` API. **Preferred.**
+- **Hard-pinned to JDK 11/17** (e.g. a managed Flink platform that refuses newer JVMs) → the JNA fork is a
+  viable, now-*proven* fallback; budget for §17.4. See `slatedb-jna-j11/README.md` for the reproducible
+  build.
 
 ---
 

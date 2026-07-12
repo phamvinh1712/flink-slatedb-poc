@@ -296,7 +296,40 @@ This file.
 
 ---
 
-## Final test scorecard (9 tests, all passing — laptop/MiniCluster only)
+## Phase 10 — Breaking the Java-22 floor (the JNA binding)
+
+**Q: "i've cloned slatedb repo, review the rust java binding. is it possible to change this binding to
+support java 11/17"**
+Discussion (verified against the clone + the published JAR): the published `io.slatedb:slatedb-uniffi` is
+**100% machine-generated** by `uniffi-bindgen-java` (IronCoreLabs), which emits **`java.lang.foreign` / FFM**
+code — decompiled the 0.14.1 JAR: bytecode **major 66**, 40 classes use `java.lang.foreign` (`Linker`,
+`SymbolLookup`, `Arena`, `upcallStub`, `downcallHandle`), **zero** use JNA. `Arena` is a *final*-API type →
+the hard **Java 22** floor (JEP 454). So "editing" the binding to target 11/17 isn't a config knob. **But** the
+native lib exports a plain **C ABI** (441 symbols, generator-agnostic), and UniFFI's Mozilla **Kotlin** backend
+uses **JNA** (Java 8+). So the floor is a *packaging* choice, removable by regenerating. ⚡ Resolved a
+contradiction: the repo's `build.gradle` + 0.14.1 POM declare a JNA dependency, but the generated code never
+calls it — JNA is used only for platform detection / native-lib extraction; the FFI is all FFM.
+
+**Q: "yes" (actually run the Kotlin-backend regeneration on JDK 17 → verified yes/no)**
+Did it end to end: built `uniffi-bindgen` 0.31.1 + the native lib (both matching `Cargo.lock`), generated the
+**Kotlin/JNA** binding (19k lines, pure JNA, 167 `suspend` fns), compiled to JVM 17 and **ran real
+put/get/flush + checkpoint on JDK 11, 17, AND 25 — all PASS**, no `--enable-native-access`, no `--add-opens`.
+⚡ Two costs surfaced by *doing* it: (a) a **uniffi-0.31 codegen bug** — error variants declare a `message`
+ctor property colliding with `Throwable.message`, doesn't compile on any kotlinc (patched 7 sites); (b)
+**version lockstep** — generating from clone HEAD (drifted past 0.14.1, added `admin_run_gc_once`) against the
+published 0.14.1 `.dylib` throws `UnsatisfiedLinkError` at runtime. Also: `suspend` fns need a Kotlin bridge to
+be callable from Java (the FFM binding's `CompletableFuture` API is free by comparison).
+
+**Q: "yes" (fold into the PoC as a 5th module + journal entry)**
+Built **`slatedb-jna-j11`**: the regenerated binding taken from the exact **`v0.14.1`** tag (so it matches the
+published native lib) + the patch + a Kotlin blocking bridge + a plain-Java driver, wired with the Kotlin Maven
+plugin. `mvn compile` + `exec:java` **PASS on JDK 11, 17, and 25** reusing the published native lib (no Rust
+toolchain to run). Documented as **§17** in the README. The floor is now not just *tolerable* (§16.3, Flink on
+JDK 25) but *removable* — at the cost of maintaining a binding fork.
+
+---
+
+## Final test scorecard (10 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
 |---|---|---|
@@ -309,6 +342,7 @@ This file.
 | `FlinkHybridTieringE2E` | §13 RocksDB-hot + SlateDB-cold | ✅ |
 | `SlateDbCompactionE2E` | §7 compaction observed + no data loss | ✅ |
 | `FlinkShardPerBucketParallelE2E` | §4/§4.1/§12.7 P=4 shard-per-bucket, shared cache | ✅ |
+| `slatedb-jna-j11` | §17 Java-22 floor is removable — JNA binding, real ops + checkpoint on JDK 11/17/25 | ✅ |
 
 ## Bugs / corrections that only RUNNING surfaced (⚡)
 
@@ -319,6 +353,9 @@ This file.
 5. **Java records break Kryo on JDK 25** → use POJOs.
 6. **`ObjectStore.resolve` needs empty path** (root) + db-name to builder (§16.7).
 7. **`Settings.set` takes JSON values** — numbers bare, durations quoted strings (§16.11).
+8. **The Java-22 floor is removable** — regenerating with UniFFI's Kotlin/JNA backend runs SlateDB on JDK
+   11/17/25 (§17). Surfaced two fork costs by running: a uniffi-0.31 `message`-collision codegen bug (won't
+   compile on any kotlinc) and mandatory binding↔native-lib version lockstep (`UnsatisfiedLinkError` otherwise).
 
 ## Still genuinely unverified (need real object storage + load, not a MiniCluster)
 
@@ -334,5 +371,8 @@ This file.
 Every "yes" was a request to **verify against source rather than assert from memory** — and it repeatedly
 paid off: the clone API shape, the checkpoint-on-Admin, the range-delete absence, the FFM/Java-22 floor, and
 above all the `flush()`-≠-manifest **data-loss bug** were all things that memory/source-reading got wrong or
-missed and only verification/running caught. The design is **correct across everything testable on a
-laptop**; its **production viability remains unproven** and is where adoption should still be gated.
+missed and only verification/running caught. The same pattern held to the end: "is the binding changeable to
+Java 11/17?" was answered not by reasoning but by **regenerating and running it** — which both proved *yes*
+(JDK 11/17/25) and surfaced the codegen bug + version-lockstep costs that reasoning alone would have missed.
+The design is **correct across everything testable on a laptop**; its **production viability remains unproven**
+and is where adoption should still be gated.
