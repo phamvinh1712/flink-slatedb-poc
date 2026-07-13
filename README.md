@@ -502,6 +502,107 @@ SlateDB writes **per-SST bloom filters**, same purpose as RocksDB's: on a point 
 
 **Why it matters more here than in RocksDB:** a RocksDB false-negative-avoidance saves a local disk read (µs); a SlateDB filter check saves an **object-store round-trip** (ms + request cost). So for point-lookup-heavy keyed state, the filter is doing proportionally more work. Nuance vs RocksDB: RocksDB can pin filter blocks separately in memory; SlateDB caches them in the meta cache (§9) — functionally equivalent for lookups, but subject to the same soft cache-eviction caveat.
 
+### 5C. On-disk file formats
+
+What SlateDB actually writes to object storage. Verified against `schemas/*.fbs` and `slatedb/src/format/*` (v0.14.1; SST format v2, manifest format v2). Useful when debugging state, sizing storage (§9A), or reasoning about the checkpoint/clone paths (§6.6).
+
+**Five file kinds, all in object storage, all write-once (immutable + CAS-ordered):**
+
+```
+<db-root>/
+├── wal/          00000000000000000001.sst   ← WAL SSTs             (zero-padded u64 id)
+├── compacted/    01J79C21YKR31J2BS1EFXJZ7MR.sst  ← L0 + sorted-run SSTs (ULID id)
+├── manifest/     00000000000000000002.manifest   ← LSM state snapshots  (zero-padded u64; highest id = current)
+├── compactions/  00000000000000000005.compactions ← compactor job state (zero-padded u64)
+└── gc/           manifest.boundary  compactions.boundary  ← GC low-water marks (bare integer)
+```
+
+#### SST files (`wal/*.sst` and `compacted/*.sst`)
+
+Same binary format for both; `sst_type` (Wal vs Compacted) and the manifest tell them apart. An SST = sorted **data blocks** + a **footer**:
+
+```
+╔════════════════════════════════════════════════════════════════════════════════╗
+║  SST FILE                                                                        ║
+║  ┌─────────── DATA BLOCKS (sorted by key) ───────────┐                           ║
+║  │ Block0 [rows…][restarts:u16…][num_restarts:u16] +CRC32 │  ~4 KiB target each  ║
+║  │ Block1 …                                           +CRC32                     ║
+║  │ …                                                                             ║
+║  ├──────────────────────── FOOTER ───────────────────────┤                       ║
+║  │ FILTER block   composite bloom filter(s)          +CRC32  (omitted if <1000 keys)║
+║  │ INDEX  block   [BlockMeta{offset, first_key}…]    +CRC32                       ║
+║  │ STATS  block   SstStats{puts,deletes,merges,sizes}+CRC32                       ║
+║  │ SsTableInfo    flatbuffer: {first_entry,last_entry, index/filter/stats         ║
+║  │                offset+len, compression, sst_type, filter_format}              ║
+║  │ meta_offset:u64  version:u16   ← fixed 10-byte tail (read first, backwards)    ║
+║  └───────────────────────────────────────────────────────┘                       ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+Read: last 10 B → version+meta_offset → SsTableInfo → points at index/filter/stats.
+get(k): bloom filter rules k out, else index binary-searches first_keys → ONE block.
+```
+
+Data block (V2, prefix-compressed, RocksDB-style): `[entry0]…[entryN][restart:u16…][num_restarts:u16] + CRC32`; restart points every 16 entries store a full key (enable binary search), entries between them delta-encode against the previous key.
+
+Per-row (record) layout — MVCC, with tombstones and TTL:
+
+```
+┌────────┬──────────┬───────────┬────────────┬───────┬──────┬───────┬────────────┬────────────┐
+│ shared │ unshared │ value_len │ key_suffix │ value │ seq  │ flags │ [expire_ts]│ [create_ts]│
+│ varint │ varint   │ varint    │ var        │ var   │ u64  │ u8    │ i64        │ i64        │
+└────────┴──────────┴───────────┴────────────┴───────┴──────┴───────┴────────────┴────────────┘
+  shared = bytes in common w/ previous key (0 at a restart point)
+  value  = OMITTED for tombstones (value_len=0)
+  seq    = MVCC sequence number      flags = TOMBSTONE 0x1 | HAS_EXPIRE_TS 0x2 | HAS_CREATE_TS 0x4 | MERGE_OPERAND
+```
+
+This row encoding is exactly why the Java `KeyValue` exposes `.seq()`, `.createTs()`, `.expireTs()` — they come straight off the wire. WAL SSTs are identical except `sst_type=Wal` and `first_entry` is a sequence number, not a key.
+
+#### Manifest (`manifest/<u64>.manifest`) — the root of truth
+
+The LSM tree lives **here**, not in the SSTs. Framing = `[u16 big-endian version][flatbuffer ManifestV2]`. A new manifest is written on every state change (flush/compaction/checkpoint) via **CAS**; the highest id is the current state.
+
+```
+[version:u16 BE = 2] + flatbuffer ManifestV2 {
+   manifest_id
+   writer_epoch, compactor_epoch      ← single-writer FENCING tokens
+   initialized                        ← clone-bootstrap flag
+   ssts:       [CompactedSsTableV2]   ← id → SST references
+   l0:         [CompactedSsTableView] ← overlapping, newest-first
+   compacted:  [SortedRunV2]          ← non-overlapping sorted runs  }  the LSM tree
+   segments:   [Segment]              ← optional (RFC-0024)
+   checkpoints:[Checkpoint{id, manifest_id, expire_time_s, create_time_s}]
+                                      ← incl. the 900s compactor checkpoints (§16.13)
+   replay_after_wal_id, wal_id_last_seen   ← WAL-replay start on recovery
+   last_l0_seq, last_l0_clock_tick, recent_snapshot_min_seq, sequence_tracker
+   external_dbs:[ExternalDb]          ← clone lineage (the exactly-once restore path, §6.6)
+}
+```
+
+This is what the checkpoint/clone/rescale machinery reads and pins (`writer_epoch`/`compactor_epoch` are the fencing tokens behind the single-writer invariant).
+
+#### Compactions (`compactions/<u64>.compactions`) — compactor work state
+
+Kept separate from the manifest so tracking in-flight jobs doesn't churn it. Framing = `[u16 BE version][flatbuffer CompactionsV1]`.
+
+```
+[version:u16 BE] + flatbuffer CompactionsV1 {
+   compactor_epoch : u64              ← fencing token
+   recent_compactions : [Compaction{
+       id : ULID                      ← start time drives the GC low-watermark (§16.13)
+       spec : Tiered/DrainSegment     ← inputs (L0 view ids, sorted-run ids)
+       status : Submitted|Scheduled|Running|Compacted|Completed|Failed
+       output_ssts : [CompactedSsTable]
+       worker : {worker_id, last_heartbeat_ms} }]
+}
+```
+
+#### GC boundary files (`gc/manifest.boundary`, `gc/compactions.boundary`)
+
+Tiny files holding a single **monotonic integer** — the id below which manifest/compactions files have been GC'd. No flatbuffer. They don't exist on a fresh DB (hence the harmless `NotFound` logs at startup) until the first GC pass.
+
+**The unifying pattern:** every file is **write-once, content-addressed by a monotonic/ULID id**; state advances by writing a *new* file and CAS-ing the manifest — never mutating in place. SSTs carry per-block CRC32; manifest/compactions rely on the object store for integrity and on CAS + `[version]` prefix for ordering/evolution. That immutability is what makes the object-store LSM viable and is the substrate the checkpoint (§6.6), clone-restore (§16.6), and GC (§16.13) logic all build on.
+
 ---
 
 ## 6. Detailed Design: Keyed State Integration
