@@ -103,6 +103,7 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      PARALLEL SHARD-PER-BUCKET E2E PASSED ✅  (§4/§4.1/§12.7 P=4, 16 shards, shared cache, exact)
                      GC E2E PASSED ✅  (§7/§16.13 compaction orphans files; compactor 900s checkpoint pins them; GC retains, no loss)
                      LONG GC E2E PASSED ✅  (§16.13 ~17min: orphans physically deleted at t+900s; 15→4 files; no loss)
+                     MARSHALLING BENCH 📊  (§16.14 serialization cheap ~4µs/16KB; async round-trip ~44µs dominates; pipeline→97k/s)
 slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 real ops + checkpoint on JDK 11, 17, AND 25 — no FFM, no flags)
 ```
 
@@ -1363,6 +1364,25 @@ hot-wins)` counts exact** for every key across demote→promote→re-demote cycl
 
 ### 16.7 One more API finding (from running it)
 `ObjectStore.resolve` **requires an empty path**: the store is the *root* (`file:///`, `s3://bucket`), and the DB path goes to the *builder* as the db-name. `resolve("file:///tmp/x")` fails with *"invalid object store path. provide path to builder instead."* Verified against the JAR. (So `new DbBuilder(dbPath, ObjectStore.resolve(rootUri))`, not a path-bearing store URI.)
+
+### 16.14 ⚡ MARSHALLING COST: serialization is cheap; async round-trip latency dominates (`SlateDbMarshalBench`)
+
+Question: is there a lot of Rust↔Java serialization overhead? **Benchmarked it** (not just source-read) on `memory:///` so all reads are block-cache hits — isolating FFI + RustBuffer copies + async plumbing from any storage cost. JDK 25, FFM binding, single-threaded driver, 20k measured ops/size after warmup:
+
+| value size | serial GET (1 await at a time) | pipelined GET (256 in flight) | batched PUT (100/batch) |
+|---|---|---|---|
+| 16 B | 43.9 µs (23k/s) | **10.3 µs/op (97k/s)** | ~1020 µs/batch |
+| 256 B | 49.5 µs (20k/s) | 12.5 µs/op (80k/s) | ~1022 µs |
+| 1 KB | 53.7 µs (19k/s) | 13.9 µs/op (72k/s) | ~1021 µs |
+| 4 KB | 58.8 µs (17k/s) | 14.2 µs/op (71k/s) | ~1030 µs |
+| 16 KB | 63.3 µs (16k/s) | 14.2 µs/op (70k/s) | ~1021 µs |
+
+Three findings, all from running:
+1. **The copies (serialization) are cheap and bulk.** Isolating throughput via the pipelined column: 16 B → 16 KB adds only **~4 µs/op**. That's the bulk `memcpy` of the extra bytes (confirmed §5.1/binding source: `Vec<u8>` ↔ `byte[]` is a whole-buffer copy via RustBuffer + `FfiConverterByteArray`, **not** field-by-field encoding). Serialization is **not** the thing to worry about.
+2. **Per-call async round-trip latency dominates, not copying.** During the serial test CPU sat at **0.1%** — the thread was *blocked waiting*, not copying. A serial `await(get)` is ~44–63 µs but pipelining 256 concurrent gets drops it to ~10–14 µs/op; that 3–4× gap is the fixed cost of driving a Rust future across the FFI and waiting for the completion callback (`upcallStub`), independent of payload size.
+3. **The flat ~1 ms/batch PUT is DURABILITY, not marshalling.** Verified in source: `WriteOptions.await_durable = true` by default, so every `write()`/`put()` blocks until the WAL flush. Flat ~1 ms regardless of size/batch confirms it. Batching 100 rows amortizes that one wait → ~10 µs/row effective.
+
+**Context that makes this a non-issue for the SlateDB-in-Flink design:** a cache-**miss** get is an S3 GET at ~1–10 ms = **100–200× the entire FFI+copy+async cost**. Storage latency dwarfs marshalling. **Practical guidance:** don't do chatty one-at-a-time `await` per key (caps ~20k ops/s/thread) — **pipeline or use `WriteBatch`** to reach ~70–97k/s and to amortize the `await_durable` WAL flush. Value size barely matters for marshalling below the multi-MB range. *Scope caveat:* single machine, `memory:///`, single-thread driver — absolute µs will shift under real Flink concurrency + S3, but the ratios (storage ≫ latency ≫ copy cost) are the robust conclusion. The JNA binding (§17) has somewhat higher per-call *latency* (reflective dispatch vs `MethodHandle`), same copy cost.
 
 ---
 

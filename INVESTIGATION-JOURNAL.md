@@ -358,6 +358,15 @@ scale), but per-DB native memory does (~1.1 GiB/DB at defaults ⇒ ~1.1 TiB for 
 compactor/GC/flusher tasks and S3 request load; mitigate with a shared block cache + few physical DBs holding
 many logical buckets. Not viable at defaults.
 
+**Q: "is there a lot of serialization overhead between rust java binding?" → "do it" (benchmark it)**
+⚡ Built `SlateDbMarshalBench` (memory:/// → isolates FFI+copy+async, cache hits only) and measured. Result
+*corrected* my source-only reasoning: **serialization is cheap** (bulk `Vec<u8>`↔`byte[]` memcpy via RustBuffer;
+16 B→16 KB adds only ~4 µs/op), but the **per-call async round-trip latency dominates** (~44 µs serial, CPU at
+0.1% = blocked waiting, not copying; pipelining 256 in-flight → ~10-14 µs/op, 97k/s). Also found the flat
+~1 ms/batch PUT is **durability** (`await_durable=true` default WAL flush), not marshalling. Verdict: binding
+overhead is a non-issue vs S3 latency (cache-miss get ~1-10 ms = 100-200× the FFI cost); guidance = pipeline /
+`WriteBatch`, don't chatty-await. Added README §16.14 + the benchmark to the e2e module.
+
 ---
 
 ## Final test scorecard (12 tests, all passing — laptop/MiniCluster only)
@@ -392,6 +401,10 @@ many logical buckets. Not viable at defaults.
 9. **Post-compaction space reclaim lags ~15 min, not `min_age`** (§16.13). GC deletes orphaned SSTs only after a
    hardcoded **900s compactor checkpoint** expires (it pins the just-compacted generation). `min_age` is not the
    gate; the 900s is not tunable from the Java binding. Proven by a 17-min run: files 15→4 exactly at t+900s.
+10. **Binding serialization is cheap; async round-trip latency dominates** (§16.14). Measured: byte marshalling
+    is bulk memcpy (~4 µs/op from 16 B→16 KB), but a serial `await(get)` is ~44 µs (CPU 0.1% — blocked, not
+    copying); pipelining hits ~97k/s. Corrected my source-only guess that copies were the main cost. Both are
+    swamped by S3 latency (~100-200×). Also: default `await_durable=true` makes each write block on a WAL flush.
 
 ## Still genuinely unverified (need real object storage + load, not a MiniCluster)
 
