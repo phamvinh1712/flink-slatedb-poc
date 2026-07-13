@@ -603,6 +603,29 @@ Tiny files holding a single **monotonic integer** — the id below which manifes
 
 **The unifying pattern:** every file is **write-once, content-addressed by a monotonic/ULID id**; state advances by writing a *new* file and CAS-ing the manifest — never mutating in place. SSTs carry per-block CRC32; manifest/compactions rely on the object store for integrity and on CAS + `[version]` prefix for ordering/evolution. That immutability is what makes the object-store LSM viable and is the substrate the checkpoint (§6.6), clone-restore (§16.6), and GC (§16.13) logic all build on.
 
+### 5D. Size limits — how big can one instance get?
+
+**There is no explicit total-size limit in SlateDB.** No `MAX_DB_SIZE`, no cap on SST count, no configured ceiling exists in the source (v0.14.1). A single instance's capacity is bounded by your object store's capacity plus a few type-width limits on *individual* items and one practical scaling pressure (the manifest).
+
+**Hard limits (from the wire format — real ceilings, not tunables):**
+
+| Item | Max | Source |
+|---|---|---|
+| **Key size** | **65,535 bytes** (`u16`), and non-empty | binding `db.rs` |
+| **Value size** | **~4 GiB** (`u32::MAX`) | binding `db.rs` |
+| **Single data block** | **64 KiB** | block-internal restart offsets are `u16` (`block_v2.rs`) — why `SstBlockSize` (§5C) maxes at 64 KiB |
+| **Items per collection crossing FFI** | `i32::MAX` (~2.1 B) | UniFFI `Vec` length is `i32` — a per-*call* cap, not a DB cap |
+
+**Unbounded by the format:** total DB size, key count, and SST count. SST block *offsets* are `u64`, the manifest lists SSTs in a `Vec` (`i32::MAX` entries), and there is no aggregate cap — so an instance scales to **terabytes–petabytes**, whatever the bucket holds. That elastic, node-independent capacity is the whole point vs. local RocksDB (§2).
+
+**The practical ceiling is the MANIFEST, not disk space.** The manifest lists *every live SST* (`ManifestV2.ssts[]`), is read on open, and is **rewritten whole on every state change** (flush/compaction/checkpoint) via CAS. So the cost that grows with DB size is *metadata management*, not storage:
+- Millions of SSTs → a large manifest that must be serialized + CAS-written on each change and re-read on recovery. Bounded by memory + manifest write latency, not a hard limit.
+- **Compaction is what keeps this in check** — it merges many small SSTs into fewer sorted runs, shrinking the live-SST count. A well-compacted multi-TB DB has a manageable manifest; an under-compacted one (compaction falling behind, §8) grows the manifest, L0 count, and read amplification. So "how big can it get" is really "can compaction keep up with your write rate."
+
+**Per-file sizing defaults (tunable, not limits):** `l0_sst_size_bytes` 64 MiB (memtable freeze target), `max_sst_size` 1 GiB (compaction output cap), `max_unflushed_bytes` 1 GiB (in-memory write buffer before backpressure — a *memory* bound per §9, not a DB-size bound).
+
+**For Flink keyed state:** per-key values < 4 GiB and keys < 64 KiB are trivially satisfied. Per-subtask DB size is effectively unbounded by SlateDB — it's gated by your S3 quota and by keeping compaction healthy. ⚠️ *Confidence:* the per-item limits are hard facts from the format; the "no total limit, manifest is the practical ceiling" conclusion is from reading the code (no cap exists) + the manifest lifecycle — **not** load-tested at multi-TB / millions-of-SSTs scale (that needs real object storage; see §11 unverified-at-scale).
+
 ---
 
 ## 6. Detailed Design: Keyed State Integration
