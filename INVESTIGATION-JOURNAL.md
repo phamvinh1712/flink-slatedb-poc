@@ -367,9 +367,19 @@ many logical buckets. Not viable at defaults.
 overhead is a non-issue vs S3 latency (cache-miss get ~1-10 ms = 100-200× the FFI cost); guidance = pipeline /
 `WriteBatch`, don't chatty-await. Added README §16.14 + the benchmark to the e2e module.
 
+**Q: "if i write and read in the same db instance before flushing, do i get consistent result? verify with a test"**
+✅ Built `ReadYourWritesE2E` (memory:///, NO flush/checkpoint anywhere → data only in the memtable). 8 checks all
+pass: put→get sees value; overwrite→get sees LATEST (MVCC newest-seq); delete→get sees null (tombstone pre-flush);
+RMW loop ×500 reads own writes (final=500); 2000 keys all consistent; scan over unflushed range in order; and
+`await_durable=false` writes still immediately readable. Confirms **read-your-writes is guaranteed within a
+single instance before any flush**, and **visibility ≠ durability** (memtable gives RYW; flush/checkpoint only
+govern crash-safety + what a *separate* reader/clone sees). This is why §16.2's flush-before-checkpoint rule was
+about the *restore* path, not live reads. Source: `batch_write.rs` (sync memtable apply) + `reader.rs`
+(newest→oldest). Added README §16.15 + §6.2 note.
+
 ---
 
-## Final test scorecard (12 tests, all passing — laptop/MiniCluster only)
+## Final test scorecard (13 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
 |---|---|---|
@@ -384,6 +394,7 @@ overhead is a non-issue vs S3 latency (cache-miss get ~1-10 ms = 100-200× the F
 | `FlinkShardPerBucketParallelE2E` | §4/§4.1/§12.7 P=4 shard-per-bucket, shared cache | ✅ |
 | `SlateDbGcE2E` | §7/§16.13 compaction orphans files; 900s compactor checkpoint pins them; GC retains | ✅ |
 | `SlateDbGcLongE2E` | §16.13 orphans physically deleted after 900s expiry (~17-min run) | ✅ |
+| `ReadYourWritesE2E` | §16.15 read-your-writes consistent before any flush (put/overwrite/delete/RMW/scan) | ✅ |
 | `slatedb-jna-j11` | §17 Java-22 floor is removable — JNA binding, real ops + checkpoint on JDK 11/17/25 | ✅ |
 
 ## Bugs / corrections that only RUNNING surfaced (⚡)

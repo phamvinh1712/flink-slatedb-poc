@@ -104,6 +104,7 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      GC E2E PASSED ✅  (§7/§16.13 compaction orphans files; compactor 900s checkpoint pins them; GC retains, no loss)
                      LONG GC E2E PASSED ✅  (§16.13 ~17min: orphans physically deleted at t+900s; 15→4 files; no loss)
                      MARSHALLING BENCH 📊  (§16.14 serialization cheap ~4µs/16KB; async round-trip ~44µs dominates; pipeline→97k/s)
+                     READ-YOUR-WRITES PASSED ✅  (§16.15 consistent reads before any flush; put/overwrite/delete/RMW/scan; visibility≠durability)
 slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 real ops + checkpoint on JDK 11, 17, AND 25 — no FFM, no flags)
 ```
 
@@ -632,6 +633,8 @@ byte[] nxt = update(cur, e);
 await(db.put(k, nxt));            // safe: single-threaded per key
 ```
 RMW here is correct because Flink processes one element at a time per subtask. Cost = throughput. Mitigate with an in-memory write-back cache for the hot set, `WriteBatch` coalescing, and flush-at-barrier.
+
+**Read-your-writes is guaranteed within the instance, before any flush** (⚡ verified, §16.15). The RMW above depends on the `get` seeing the prior `put` even though nothing was flushed — this holds because a write lands in the **mutable memtable synchronously** and reads go newest→oldest (memtable → imm memtables → SSTs), so unflushed writes are found first; MVCC sequence numbers make overwrites/deletes resolve to the latest. Crucially, **visibility is independent of durability**: even `await_durable=false` writes are immediately readable by the same instance (flush/checkpoint only govern crash-safety + what a *separate* reader/clone sees, not your own reads). So the write-back-cache mitigation is a throughput optimization, **not** a correctness requirement — SlateDB itself already gives you consistent reads pre-flush.
 
 **`RichAsyncFunction`** keeps N requests in flight → throughput, **but two in-flight updates to the same key can interleave, and there are no timers / no Flink keyed state inside it.**
 - ✅ read-through lookups, idempotent/blind writes.
@@ -1383,6 +1386,17 @@ Three findings, all from running:
 3. **The flat ~1 ms/batch PUT is DURABILITY, not marshalling.** Verified in source: `WriteOptions.await_durable = true` by default, so every `write()`/`put()` blocks until the WAL flush. Flat ~1 ms regardless of size/batch confirms it. Batching 100 rows amortizes that one wait → ~10 µs/row effective.
 
 **Context that makes this a non-issue for the SlateDB-in-Flink design:** a cache-**miss** get is an S3 GET at ~1–10 ms = **100–200× the entire FFI+copy+async cost**. Storage latency dwarfs marshalling. **Practical guidance:** don't do chatty one-at-a-time `await` per key (caps ~20k ops/s/thread) — **pipeline or use `WriteBatch`** to reach ~70–97k/s and to amortize the `await_durable` WAL flush. Value size barely matters for marshalling below the multi-MB range. *Scope caveat:* single machine, `memory:///`, single-thread driver — absolute µs will shift under real Flink concurrency + S3, but the ratios (storage ≫ latency ≫ copy cost) are the robust conclusion. The JNA binding (§17) has somewhat higher per-call *latency* (reflective dispatch vs `MethodHandle`), same copy cost.
+
+### 16.15 READ-YOUR-WRITES before any flush (`ReadYourWritesE2E`)
+
+Verifies the pre-flush consistency guarantee §6.2 relies on: within a single `Db` instance, a read sees your own writes **before any `flush`/`checkpoint`**. Ran on `memory:///` (no disk/S3 that could mask unflushed data) with **no flush anywhere** — the only way a read succeeds is via the in-memory memtable path. All 8 checks passed:
+- **put→get** sees the value; **overwrite→get** sees the LATEST (`3`, not `1`/`2` — MVCC newest-seq wins); **delete→get** sees `null` (tombstone honored pre-flush).
+- **RMW loop ×500** (get→+1→put, never flushed) → final = exactly 500 (reads its own writes every iteration, no stale reads).
+- **2000 keys** written then all read back → 0 missing, 0 wrong.
+- **scan** over an unflushed range → rows returned in key order.
+- **`await_durable=false`** → the write is still immediately readable by the same instance. Proves **visibility ≠ durability**: RYW comes from the memtable; `await_durable`/flush only govern crash-safety and what a *separate* reader/clone sees.
+
+Mechanism (source): write lands in the mutable memtable synchronously; `get`/`scan` read newest→oldest (memtable → imm memtables → SSTs), first hit wins (`reader.rs`, `batch_write.rs`). **Scope:** single-writer, single-instance — the exact SlateDB-as-Flink-keyed-state model (one DB per subtask, same instance does the RMW). A *different* `DbReader`/clone would NOT see unflushed writes (it reads durable storage / a pinned checkpoint) — which is why the §16.2 flush-before-checkpoint rule exists for the *restore* path but live reads were always consistent.
 
 ---
 
