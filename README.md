@@ -265,6 +265,78 @@ ForSt is the integrated answer and should be the default consideration. The crit
 
 **Counterpoint (important):** ForSt is *natively integrated* with the checkpoint coordinator, rescaling, and timer system. SlateDB is not. This doc is the price of that gap. **Re-evaluate ForSt before committing** — the DIY SlateDB path only wins if you specifically want SlateDB's data structure / cost model and accept the integration burden.
 
+### 2.1 Architecture at a glance
+
+SlateDB is an LSM key-value store whose **durable state lives entirely in object storage**; the process holds only volatile state (memtables + caches). This diagram is verified against the v0.14.1 source — §§ below expand each piece.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                          PROCESS (e.g. Flink TaskManager JVM)                      │
+│                                                                                    │
+│   Java/Kotlin app ──FFM (§17) or JNA──▶ SlateDB binding ──▶ shared Tokio runtime   │
+│                                                             (1 per process, §4.1)  │
+│                                                                                    │
+│  ┌────────────────────────────  Db (single writer)  ─────────────────────────┐    │
+│  │                                                                            │    │
+│  │   WRITE PATH                              READ PATH  get(k) ── newest→oldest│   │
+│  │   put/delete/merge/write                            │                      │    │
+│  │        │                                            ▼                      │    │
+│  │        ▼  (1) durability                     ┌────────────┐               │    │
+│  │   ┌─────────────┐                            │  memtable  │ (mutable)     │    │
+│  │   │ WAL buffer  │──flush──▶ wal/*.sst        └─────┬──────┘               │    │
+│  │   └─────────────┘           (object store)         ▼                      │    │
+│  │        │  (2)                              ┌──────────────────┐           │    │
+│  │        ▼                                   │ immutable memtbls│           │    │
+│  │   ┌─────────────┐   freeze                 └────────┬─────────┘           │    │
+│  │   │  memtable   │───────▶ imm memtables ─────────────┘                     │   │
+│  │   └─────────────┘            │ flush (MEM_TABLE, §16.2) │ miss              │   │
+│  │                              ▼                          ▼                   │  │
+│  │                        compacted/*.sst  ◀──── read ──── on-disk LSM        │    │
+│  │                          (L0 SSTs)                  (via block cache)       │   │
+│  │                                                                            │    │
+│  │   IN-MEMORY CACHES (off-heap, native — NOT Flink-managed, §9):             │    │
+│  │     • block cache  512 MiB  (foyer default / moka, §9.1a) ── SST blocks    │    │
+│  │     • meta  cache  128 MiB  ── SST indexes + BLOOM FILTERS (§5B)           │    │
+│  │                                                                            │    │
+│  │   BACKGROUND TASKS (on the shared Tokio runtime):                          │    │
+│  │     • Memtable flusher   imm memtable ─▶ L0 SST                            │    │
+│  │     • Compactor          L0 SSTs ─▶ sorted runs (rewrites manifest;        │    │
+│  │                          leaves orphans; pins them via 900s checkpoint)    │    │
+│  │     • Garbage collector  deletes orphaned SSTs after expiry (§16.13)       │    │
+│  └────────────────────────────────────────────────────────────────────────────┘  │
+│         │ CAS + epoch fencing  →  single-writer invariant (⇒ one DB per subtask)   │
+└─────────┼──────────────────────────────────────────────────────────────────────────┘
+          │  all durable state lives here (nothing durable on local disk)
+          ▼
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                    OBJECT STORAGE  (S3 / GCS / Azure / file://)                    ║
+║                                                                                    ║
+║   <db-root>/                                                                       ║
+║     ├── wal/          00…001.sst, 00…002.sst        ── write-ahead log SSTs        ║
+║     ├── compacted/    <ULID>.sst, <ULID>.sst        ── L0 SSTs + sorted-run SSTs   ║
+║     ├── manifest/     <n>.manifest  (CAS-updated)   ── LSM state + checkpoints     ║
+║     └── gc/           *.boundary                    ── GC bookkeeping              ║
+║                                                                                    ║
+║   ┌──────────────────────  LSM tree (described by the manifest)  ──────────────┐  ║
+║   │   L0:  [sst][sst][sst]…    newest, overlapping (l0_max_ssts_per_key=8       │  ║
+║   │                            → write backpressure when exceeded, §8)          │  ║
+║   │   SR1: [────── sorted run ──────]     compacted, non-overlapping            │  ║
+║   │   SR2: [──────────── sorted run ────────────]     ↑ compaction merges L0→SR │  ║
+║   │   …    (size-tiered; older/larger runs toward the bottom)                   │  ║
+║   └────────────────────────────────────────────────────────────────────────────┘ ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+OPTIONAL (off by default): object-store disk cache → local NVMe (caches SST parts,
+                            §9A) — the ONLY path that touches local disk.
+```
+
+**Reading it:**
+- **Write = two steps:** WAL buffer first for durability (→ `wal/*.sst`), then the memtable (`batch_write.rs`). A full memtable freezes → the flusher writes it as an **L0 SST**.
+- **Read = newest→oldest:** mutable memtable → immutable memtables → on-disk LSM (L0, then sorted runs), first hit wins (`reader.rs`); bloom filters (§5B) skip SSTs that can't hold the key.
+- **The disaggregation line is the process boundary** — everything durable is in object storage; in-process is only volatile memtables + caches (native/off-heap, the §9 OOM risk). Local disk is untouched unless the optional disk cache is enabled.
+- **Compaction ≠ deletion** — the compactor rewrites the manifest and orphans old SSTs; the GC reclaims them only after a 900s checkpoint expiry (§16.13).
+- **Single-writer** via CAS + epoch fencing on the manifest — the reason the Flink model is **one DB per subtask** (§4).
+
 ---
 
 ## 3. Background: Flink Keyed State & Rescaling Model
