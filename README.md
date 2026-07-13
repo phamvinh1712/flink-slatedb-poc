@@ -105,6 +105,7 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      LONG GC E2E PASSED ✅  (§16.13 ~17min: orphans physically deleted at t+900s; 15→4 files; no loss)
                      MARSHALLING BENCH 📊  (§16.14 serialization cheap ~4µs/16KB; async round-trip ~44µs dominates; pipeline→97k/s)
                      READ-YOUR-WRITES PASSED ✅  (§16.15 consistent reads before any flush; put/overwrite/delete/RMW/scan; visibility≠durability)
+                     FLINK-SERDE PASSED ✅  (§16.16 Flink TypeSerializer ⇄ SlateDB byte[]; PojoSerializer round-trips 1000 objects + RMW)
 slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 real ops + checkpoint on JDK 11, 17, AND 25 — no FFM, no flags)
 ```
 
@@ -640,6 +641,27 @@ SlateDB has **no column families** (unlike RocksDB), so multiplex all states int
      scans
 ```
 `keyGroupPrefixBytes` = 1 if `maxParallelism <= 128`, else 2 (mirror Flink). Sorted LSM order ⇒ a *range* of key groups is one contiguous byte range → same trick Flink plays for rescale.
+
+### 6.1a Value serialization — reuse Flink's `TypeSerializer` (✅ verified, `FlinkSerdeSlateDbE2E`)
+
+SlateDB stores `byte[]`, no type info — exactly like RocksDB (§5B, §16.14). So serialize objects **the same way Flink's RocksDB backend does**: obtain a `TypeSerializer<T>` from `TypeInformation` and encode via `DataOutputSerializer` / `DataInputDeserializer` — the identical primitives `RocksDBValueState` uses internally. Don't hand-roll (never `ObjectOutputStream`).
+
+```java
+TypeSerializer<T> ser = TypeInformation.of(MyPojo.class).createSerializer(execConfig);
+// reuse buffers per operator (single-threaded per subtask) — no per-call alloc
+DataOutputSerializer out = new DataOutputSerializer(64);
+DataInputDeserializer in  = new DataInputDeserializer();
+byte[] toBytes(T v)  { out.clear(); ser.serialize(v, out); return out.getCopyOfBuffer(); }  // → db.put
+T fromBytes(byte[] b){ in.setBuffer(b, 0, b.length); return ser.deserialize(in); }           // ← db.get
+```
+
+Verified by `FlinkSerdeSlateDbE2E`: Flink's `PojoSerializer` round-trips a POJO (incl. object RMW: read→mutate→write) through SlateDB byte-for-byte across 1000 keys. Caveats found by running:
+- **Use POJOs with a no-arg ctor** (→ Flink `PojoSerializer`), not Java `record`s — Kryo can't serialize records on JDK 16+ (§16.10), and this path runs on JDK 22+/25.
+- **Use mutable collections** (`ArrayList`, not `List.of(...)`) for collection fields — Flink routes them through Kryo, which deserializes into a mutable list; an immutable one round-trips on read but breaks on a later `.add()`.
+- **Schema evolution is NOT free.** Flink's RocksDB backend migrates state across savepoints via `TypeSerializerSnapshot`; SlateDB isn't wired to that machinery, so you version your own schema or persist the serializer snapshot. Part of the "reimplement the state-backend integration layer" cost (§15).
+- **Order-preservation:** Flink serializers aren't guaranteed byte-order-preserving — fine for point `get`/`put`, a caveat if you rely on `scan` ordering by value.
+
+**Avoiding repeated deserialization on hot reads.** SlateDB's block cache (§9) caches decoded SST *blocks* (bytes) — it cannot cache your Java object, so every `get` still pays FFI copy + `deserialize` even on a cache hit. From §16.14 that's only a **few µs**, and the block cache already removes the expensive part (the ~1–10 ms S3 read) — so **relying on SlateDB's block cache is the right default**; re-deserializing per hit is µs-noise. Only if profiling shows deserialize is a genuine hotspot (same key read at very high frequency) add a **bounded on-heap object cache** (`key → live object`) in front — write-through for read-heavy, write-back-at-barrier for RMW-heavy (that's the §13 hot tier). It doesn't *defeat* SlateDB's cache (different layers: bytes vs. objects), but at full size the two double-cache the hot set — so if you add it, shrink SlateDB's block cache (§9.1a) to reclaim off-heap. Don't build it preemptively.
 
 ### 6.2 Write/read path & the sync/async boundary
 The one boundary that's yours: **`CompletableFuture` vs. Flink's single-threaded-per-subtask operator model.** Two shapes:
@@ -1420,6 +1442,10 @@ Verifies the pre-flush consistency guarantee §6.2 relies on: within a single `D
 - **`await_durable=false`** → the write is still immediately readable by the same instance. Proves **visibility ≠ durability**: RYW comes from the memtable; `await_durable`/flush only govern crash-safety and what a *separate* reader/clone sees.
 
 Mechanism (source): write lands in the mutable memtable synchronously; `get`/`scan` read newest→oldest (memtable → imm memtables → SSTs), first hit wins (`reader.rs`, `batch_write.rs`). **Scope:** single-writer, single-instance — the exact SlateDB-as-Flink-keyed-state model (one DB per subtask, same instance does the RMW). A *different* `DbReader`/clone would NOT see unflushed writes (it reads durable storage / a pinned checkpoint) — which is why the §16.2 flush-before-checkpoint rule exists for the *restore* path but live reads were always consistent.
+
+### 16.16 FLINK OBJECT SERIALIZATION into SlateDB (`FlinkSerdeSlateDbE2E`)
+
+Verifies §6.1a: store Java objects in SlateDB the way Flink's RocksDB backend does — via a Flink `TypeSerializer`, since SlateDB stores only `byte[]`. Flink chose `PojoSerializer` for the test POJO; all 4 checks passed: single POJO round-trips equal; **1000 POJOs** round-trip field-for-field after flush (0 wrong); **object RMW ×50** (read→mutate→write: balance 100→600, list field grew 2→52). Two gotchas surfaced by running: (1) collection fields go through Kryo → must be **mutable** (`ArrayList`, not `List.of`) or a later `.add()` throws on the deserialized immutable list; (2) POJOs not `record`s (Kryo/records break on JDK 16+, §16.10). Confirms the serialization layer is Flink's own, unchanged — the same `DataOutputSerializer`/`DataInputDeserializer` primitives `RocksDBValueState` uses — with SlateDB just holding the resulting bytes.
 
 ---
 

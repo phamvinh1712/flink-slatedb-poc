@@ -377,9 +377,24 @@ govern crash-safety + what a *separate* reader/clone sees). This is why §16.2's
 about the *restore* path, not live reads. Source: `batch_write.rs` (sync memtable apply) + `reader.rs`
 (newest→oldest). Added README §16.15 + §6.2 note.
 
+**Q: "how can i make slatedb serialize/deserialize java objects like flink does in rocksdb?" + "how to avoid
+repeated deserialization?" + "does an on-heap object cache defeat slatedb's cache?"**
+✅ Built `FlinkSerdeSlateDbE2E`: reuse Flink's own `TypeSerializer` (from `TypeInformation.createSerializer`)
++ `DataOutputSerializer`/`DataInputDeserializer` — the identical primitives `RocksDBValueState` uses — and hand
+the resulting `byte[]` to SlateDB (which stores bytes, no type info, like RocksDB). Flink picked `PojoSerializer`;
+1000 POJOs + object RMW round-trip intact. ⚡ Two gotchas by running: collection fields go through Kryo so must be
+mutable (`ArrayList`, not `List.of` — immutable breaks on later `.add()`); POJOs not records (Kryo/records break
+JDK 16+). Repeated-deserialization answer: SlateDB's block cache caches decoded *blocks* (bytes), not objects, so
+each hit still costs FFI-copy + deserialize (~few µs, §16.14) — but that's swamped by the ~1-10 ms S3 read the
+block cache already saves, so **relying on the block cache is the right default**; only add a bounded on-heap
+object cache (the §13 hot tier) if profiling shows deserialize is a real hotspot. It does NOT defeat SlateDB's
+cache (different layers: objects vs bytes) but double-caches the hot set at full size → shrink the block cache if
+you add one. Schema evolution is the one RocksDB feature you'd rebuild (no `TypeSerializerSnapshot` integration).
+Added README §6.1a + §16.16.
+
 ---
 
-## Final test scorecard (13 tests, all passing — laptop/MiniCluster only)
+## Final test scorecard (14 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
 |---|---|---|
@@ -395,6 +410,7 @@ about the *restore* path, not live reads. Source: `batch_write.rs` (sync memtabl
 | `SlateDbGcE2E` | §7/§16.13 compaction orphans files; 900s compactor checkpoint pins them; GC retains | ✅ |
 | `SlateDbGcLongE2E` | §16.13 orphans physically deleted after 900s expiry (~17-min run) | ✅ |
 | `ReadYourWritesE2E` | §16.15 read-your-writes consistent before any flush (put/overwrite/delete/RMW/scan) | ✅ |
+| `FlinkSerdeSlateDbE2E` | §16.16 Flink TypeSerializer ⇄ SlateDB byte[] (PojoSerializer round-trips objects + RMW) | ✅ |
 | `slatedb-jna-j11` | §17 Java-22 floor is removable — JNA binding, real ops + checkpoint on JDK 11/17/25 | ✅ |
 
 ## Bugs / corrections that only RUNNING surfaced (⚡)
