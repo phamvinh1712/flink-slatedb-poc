@@ -392,6 +392,23 @@ cache (different layers: objects vs bytes) but double-caches the hot set at full
 you add one. Schema evolution is the one RocksDB feature you'd rebuild (no `TypeSerializerSnapshot` integration).
 Added README §6.1a + §16.16.
 
+**Q: "trigger compaction from a downstream Flink operator + pause/resume the writer? can Flink signal
+downstream→upstream?" → "verify compaction doesn't block writes" → "just point me to the doc/test that
+confirms it"**
+Discussion: the premise doesn't hold — (1) compaction is non-blocking (reads immutable SSTs, swaps manifest
+via CAS+epoch, no lock), so writes never need pausing; (2) the Java binding exposes only `CompactorStateView`
+(read-only) — no `CompactorBuilder`/`run-compactor`, so you can't trigger compaction from Java anyway
+(standalone compactor is Rust-only); (3) Flink dataflow is strictly upstream→downstream — no native back-edge.
+Embedded compactor polls every 5s (default); disable via `compactor_options=null` (⚠️ then run a sidecar or L0
+backpressure eventually stalls writes). ⚡ **Tried to write our own non-blocking test and abandoned it** — a
+single-machine flush-per-batch workload kept inducing **L0 backpressure** (writes pausing ~9s at the
+`l0_max_ssts_per_key=8` wall), which *looks* like blocking but is the §8 phenomenon, not compaction
+stop-the-world. Couldn't cleanly separate the two on a laptop. Correct move: cite SlateDB's own evidence —
+`rfcs/0002-compaction.md:383` (compactor runs alongside the writer) + the CAS protocol (184–190/331–333) +
+in-tree test `test_compactor_compacts_l0` (`compactor.rs:1602`, writes to a live DB with compactor active, reads
+back intact). Added provenance to README §7.3; deleted the abandoned test. Lesson: not everything is best
+verified by our own running — sometimes the authoritative proof is upstream's tests against the real code.
+
 ---
 
 ## Final test scorecard (14 tests, all passing — laptop/MiniCluster only)

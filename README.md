@@ -786,6 +786,12 @@ One-DB-per-subtask = N compactors per TM *and* N shifting compactor targets on e
 ### 7.3 Does compaction block writes?
 **Not directly.** Compaction reads immutable SSTs and writes new ones; writes flow to WAL/memtable/new-L0 on a separate path. Writer and compactor coordinate via **CAS + epoch fencing** on the manifest (retry on conflict, no mutual blocking; disjoint parts). **This is why a standalone compactor can safely run against a live Flink writer.**
 
+**Provenance (SlateDB's own source/tests, not our test):**
+- **`rfcs/0002-compaction.md:383`** states the compactor runs *"alongside the main writer-reader in the same process"* (or a separate process) — only possible because they don't block each other.
+- The **CAS coordination protocol** (`rfcs/0002-compaction.md:184–190, 331–333`): writer and compactor each update the manifest by optimistic **compare-and-swap keyed on `writer_epoch`/`compactor_epoch`**; a CAS conflict causes a **retry, never a wait** — there is no shared lock.
+- Verified by SlateDB's test **`test_compactor_compacts_l0`** (`slatedb/src/compactor.rs:1602`): writes to a live `Db` **with the embedded compactor active**, awaits compaction, then reads every key back intact. (Plus the fencing tests, e.g. `test_should_fail_when_compactions_store_fences_compactor`.)
+- *We did not add our own test here:* a single-machine test can't cleanly separate "compaction blocking" from **L0 backpressure** (below) — an over-aggressive flush rate induces backpressure stalls that look like blocking but aren't. SlateDB's in-tree tests already prove the property against the real coordination code.
+
 **But writes DO block via L0 backpressure when compaction falls behind:**
 ```
 compaction can't keep up → L0 SST count climbs → hits threshold → writes PAUSE
