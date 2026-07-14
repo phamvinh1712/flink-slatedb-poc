@@ -409,9 +409,20 @@ in-tree test `test_compactor_compacts_l0` (`compactor.rs:1602`, writes to a live
 back intact). Added provenance to README §7.3; deleted the abandoned test. Lesson: not everything is best
 verified by our own running — sometimes the authoritative proof is upstream's tests against the real code.
 
+**Q: "how do I use RFC-0004 projection/union for database merge/split? show an example" → "yes" (build it)**
+Read RFC 0004's Projection/Union section, then verified the API is reachable from Java (via `javap` on the JAR):
+**split = projection** (`CloneBuilder.withProjectionRange` / per-source `KeyRange`), **merge = union**
+(`CloneBuilder.withSource` called repeatedly — it *accumulates* sources; discovered this isn't obvious from the
+RFC). Built `SlateDbMergeSplitE2E`: populate 600 keys → flush → split into two projected shards → union them
+back. ✅ All 5 checks pass: each shard has exactly its half (projection clips cleanly), union has all 600 keys
+correct, merged DB is writable. RFC rules confirmed: union needs **non-overlapping + adjacent** ranges and
+**WAL flushed to L0 first**; `checkpoint=null` clones latest. This is the clean RFC way to do the §6.4 rescale
+(downscale=union, upscale=projection) — closes the gap `SlateDbRescaleE2E` left (it did merge via manual
+scan-copy). Added README §6.4 note + §16.17.
+
 ---
 
-## Final test scorecard (14 tests, all passing — laptop/MiniCluster only)
+## Final test scorecard (15 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
 |---|---|---|
@@ -428,6 +439,7 @@ verified by our own running — sometimes the authoritative proof is upstream's 
 | `SlateDbGcLongE2E` | §16.13 orphans physically deleted after 900s expiry (~17-min run) | ✅ |
 | `ReadYourWritesE2E` | §16.15 read-your-writes consistent before any flush (put/overwrite/delete/RMW/scan) | ✅ |
 | `FlinkSerdeSlateDbE2E` | §16.16 Flink TypeSerializer ⇄ SlateDB byte[] (PojoSerializer round-trips objects + RMW) | ✅ |
+| `SlateDbMergeSplitE2E` | §16.17 RFC-0004 projection split + union merge (600 keys intact, merged DB writable) | ✅ |
 | `slatedb-jna-j11` | §17 Java-22 floor is removable — JNA binding, real ops + checkpoint on JDK 11/17/25 | ✅ |
 
 ## Bugs / corrections that only RUNNING surfaced (⚡)

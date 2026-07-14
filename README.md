@@ -106,6 +106,7 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      MARSHALLING BENCH 📊  (§16.14 serialization cheap ~4µs/16KB; async round-trip ~44µs dominates; pipeline→97k/s)
                      READ-YOUR-WRITES PASSED ✅  (§16.15 consistent reads before any flush; put/overwrite/delete/RMW/scan; visibility≠durability)
                      FLINK-SERDE PASSED ✅  (§16.16 Flink TypeSerializer ⇄ SlateDB byte[]; PojoSerializer round-trips 1000 objects + RMW)
+                     MERGE/SPLIT PASSED ✅  (§16.17 RFC-0004 projection split + union merge; 600 keys intact, merged DB writable)
 slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 real ops + checkpoint on JDK 11, 17, AND 25 — no FFM, no flags)
 ```
 
@@ -737,6 +738,19 @@ for (Handle s : sources) { if (s==base) continue;
 Key property: each key group is owned by exactly one old subtask → **no key-level merge conflicts, no last-writer-wins** — clean partition copy.
 - **Upscale:** target usually inside one old range → clone base, copy at most a sliver. Cheap.
 - **Downscale:** target = union of several old ranges → clone biggest, scan-copy the rest. **This is where byte movement shows up.**
+
+**Better: use RFC-0004 projection + union instead of scan-copy (✅ verified, §16.17).** The scan-copy merge above works but physically re-reads/re-writes every non-base source. SlateDB ships the RFC-blessed primitives that avoid the copy — both **reachable from Java** via `CloneBuilder`:
+- **Split (upscale) = projection:** `cb.withProjectionRange(range)` (or the range on `CloneSourceSpec`) clones a DB restricted to a key range; keys outside are logically deleted. Near-zero copy (shallow, shares SSTs).
+- **Merge (downscale) = union:** call **`cb.withSource(spec)` once per source** — the builder accumulates them and `build()` unions the non-overlapping shards into one DB, no scan-copy.
+```java
+// downscale: union the ranges this subtask now owns (one withSource per old shard)
+CloneBuilder cb = admin.createCloneBuilderFromSource(
+        new CloneSourceSpec(shardA, null, keyRangeFor(rangeA)));   // 1st source + its range
+cb.withSource(new CloneSourceSpec(shardB, null, keyRangeFor(rangeB)));  // APPENDS 2nd source
+cb.withClonePath(myNewPath);
+await(cb.build());   // myNewPath = union(A,B), referencing both shards' SSTs
+```
+**Union's rules (enforced — the op fails otherwise):** sources must be **non-overlapping AND adjacent** in key space, and each source's **WAL must be flushed to L0 first** (`flushWithOptions(MEM_TABLE)`; union can't merge WAL state). Your key-group prefixing (§6.1) makes ranges naturally non-overlapping/adjacent, so this fits rescale exactly. ⚠️ It's **your** job to track which range each DB owns and supply it (SlateDB doesn't remember). Verified end-to-end in §16.17.
 
 ### 6.5 Clone lifecycle caveat (GC)
 Clones are **not self-contained**: they read the parent's SSTs at the parent path and pin them via the checkpoint. Therefore:
@@ -1452,6 +1466,14 @@ Mechanism (source): write lands in the mutable memtable synchronously; `get`/`sc
 ### 16.16 FLINK OBJECT SERIALIZATION into SlateDB (`FlinkSerdeSlateDbE2E`)
 
 Verifies §6.1a: store Java objects in SlateDB the way Flink's RocksDB backend does — via a Flink `TypeSerializer`, since SlateDB stores only `byte[]`. Flink chose `PojoSerializer` for the test POJO; all 4 checks passed: single POJO round-trips equal; **1000 POJOs** round-trip field-for-field after flush (0 wrong); **object RMW ×50** (read→mutate→write: balance 100→600, list field grew 2→52). Two gotchas surfaced by running: (1) collection fields go through Kryo → must be **mutable** (`ArrayList`, not `List.of`) or a later `.add()` throws on the deserialized immutable list; (2) POJOs not `record`s (Kryo/records break on JDK 16+, §16.10). Confirms the serialization layer is Flink's own, unchanged — the same `DataOutputSerializer`/`DataInputDeserializer` primitives `RocksDBValueState` uses — with SlateDB just holding the resulting bytes.
+
+### 16.17 DB SPLIT + MERGE via RFC-0004 projection & union (`SlateDbMergeSplitE2E`)
+
+Verifies the RFC-0004 rescale primitives (§6.4) end-to-end — the actual **union** path, which `SlateDbRescaleE2E` (§16.9) left as a manual scan-copy. Populated a 600-key DB (flushed to L0), then:
+- **SPLIT via projection** — cloned the source twice with `CloneBuilder.withProjectionRange`: `shard-lo`=[key-000000, key-000300), `shard-hi`=[key-000300, key-000599]. ✅ Each shard has **exactly its half** (300 keys, 0 wrong, nothing leaked across the boundary — projection physically clips).
+- **MERGE via union** — cloned from **two sources** (`createCloneBuilderFromSource(lo)` + `withSource(hi)`, each carrying its own `KeyRange`). ✅ The merged DB has **all 600 keys with correct values**, is **writable** (new `key-000600` landed), and serves keys from both shards live.
+
+API findings (verified in the JAR + confirmed by running): `CloneBuilder.withSource` **accumulates** sources → repeated calls perform the union; `CloneSourceSpec(path, checkpoint, range)` with `checkpoint=null` clones the *latest* state; `withProjectionRange`/per-source range clip. RFC preconditions the op enforces: sources **non-overlapping + adjacent**, and **WAL flushed to L0 first** (we flushed the source before splitting). This is the clean way to do the §6.4 rescale — no scan-copy. (Scope: single-process, `file:///`; the multi-writer coordination + `external_dbs` GC-pinning lifecycle at scale is not exercised here.)
 
 ---
 
