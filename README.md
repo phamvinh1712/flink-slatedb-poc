@@ -109,12 +109,15 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      MERGE/SPLIT PASSED ✅  (§16.17 RFC-0004 projection split + union merge; 600 keys intact, merged DB writable)
                      TTL PASSED ✅  (§18.6 native TTL — ⚡ FOUND: lazy compaction-reclaim, NOT read-time expiry; corrected a wrong "correction")
                      FENCING PASSED ✅  (§18.9 2nd writer fences 1st → Error.Closed{reason=FENCED} "detected newer DB client")
+                     RESCALE+SAVEPOINT PASSED ✅  (§16.18 REAL Flink savepoint→P2→P4→P1 rescale fused w/ SlateDB projection+union; exactly-once, every key=9)
 slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 real ops + checkpoint on JDK 11, 17, AND 25 — no FFM, no flags)
 ```
 
 Untested (need real infra/load, not a MiniCluster): §8 L0 write-stall backpressure, §9/§9A memory-OOM/disk,
-§14 resharding, real parallel savepoint→rescale, and all §11 operational risks (S3 tail latency, cost, pre-1.0
-format stability, failover fencing under concurrency).
+§14 resharding (changing maxParallelism), and all §11 operational risks (S3 tail latency, cost, pre-1.0 format
+stability, failover fencing under concurrency). *(Real savepoint→rescale→restore is now VERIFIED — §16.18 —
+fused with SlateDB projection/union on a MiniCluster, up+downscale, exactly-once; only real-S3/multi-node scale
+remains.)*
 
 `flink-slatedb-e2e` has TWO mains:
 - `FlinkSlateDbE2E` — barrier-sentinel checkpoint + clone-restore (simpler).
@@ -1480,6 +1483,18 @@ Verifies the RFC-0004 rescale primitives (§6.4) end-to-end — the actual **uni
 - **MERGE via union** — cloned from **two sources** (`createCloneBuilderFromSource(lo)` + `withSource(hi)`, each carrying its own `KeyRange`). ✅ The merged DB has **all 600 keys with correct values**, is **writable** (new `key-000600` landed), and serves keys from both shards live.
 
 API findings (verified in the JAR + confirmed by running): `CloneBuilder.withSource` **accumulates** sources → repeated calls perform the union; `CloneSourceSpec(path, checkpoint, range)` with `checkpoint=null` clones the *latest* state; `withProjectionRange`/per-source range clip. RFC preconditions the op enforces: sources **non-overlapping + adjacent**, and **WAL flushed to L0 first** (we flushed the source before splitting). This is the clean way to do the §6.4 rescale — no scan-copy. (Scope: single-process, `file:///`; the multi-writer coordination + `external_dbs` GC-pinning lifecycle at scale is not exercised here.)
+
+### 16.18 ⭐ REAL Flink savepoint → rescale → restore FUSED with SlateDB projection/union (`FlinkRescaleSavepointE2E`)
+
+The gap §16.9/§16.17 left: those tested the SlateDB rescale *algorithm standalone*. This tests it **fused with an actual Flink savepoint/rescale lifecycle on a real MiniCluster** (Flink 1.20.1, JDK 25) — the "does it really work in Flink?" question, which the doc had marked *inferred, not tested*.
+
+Mechanism: a keyed RMW counter with SlateDB per subtask; a `CheckpointedFunction` stores each subtask's `dbPath|slateCpId|kgLo|kgHi` in **union list state** (the primitive Flink redistributes to every subtask on rescale). On restore at a new parallelism, each new subtask computes its own `KeyGroupRange`, finds the old shards intersecting it, and **unions them (projecting each to the overlap)** via `CloneBuilder.withSource` — RFC-0004 union+projection **driven by the redistributed savepoint state**. Ran three jobs through `MiniCluster.submitJob` + `stopWithSavepoint` + `SavepointRestoreSettings`:
+- **Run1 @ P=2** (fresh): subtasks own kg[0-63], kg[64-127].
+- **Run2 @ P=4** (UPSCALE, restored from sp1): each new subtask **projected** its slice — e.g. s2 kg[64-95] ← old-s1[64-127]∩[64-95]. ✅
+- **Run3 @ P=1** (DOWNSCALE, restored from sp2): the single subtask **unioned all four** run2 DBs (each projected to its overlap) into one. ✅
+- **Verdict:** every key counted **exactly 9** (3 runs × 3 rounds) — **exactly-once preserved across two rescales + two savepoint round-trips**, both upscale and downscale.
+
+This graduates the §6.4 rescale from "algorithm verified standalone + inferred-in-Flink" to **verified end-to-end inside a real Flink savepoint/rescale cycle**. Scope/caveats: single-JVM MiniCluster on `file:///` (not real S3, not multi-node); the union runs inside `initializeState` synchronously (fine at this scale, but a large downscale union would extend restore time — the §18.2 checkpoint-lifetime and cold-start-warming concerns still apply at scale). Union preconditions held automatically because key-group ranges are contiguous, non-overlapping, and adjacent by construction (§6.1 big-endian prefix, §18.3).
 
 ---
 

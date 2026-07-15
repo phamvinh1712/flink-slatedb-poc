@@ -464,9 +464,12 @@ both valuable:
   compaction-non-blocking test): reading finds candidates, running finds truth. Rewrote §18.6/§15.3 accordingly;
   added §18.12 recording both graduations.
 
+**Q: "the full stop-savepoint → rescale → restart cycle fused with projection/union inside a real Flink job — can you test this?" → "yes"**
+⭐ Built `FlinkRescaleSavepointE2E` — the flagship integration test, closing the gap I'd explicitly flagged as *inferred, not tested*. A real `MiniCluster` (Flink 1.20.1, JDK 25) runs three jobs via `submitJob` + `stopWithSavepoint` + `SavepointRestoreSettings`: **P=2 → savepoint → P=4 (upscale) → savepoint → P=1 (downscale)**. Each subtask's SlateDB (dbPath|cpId|keyGroupRange) rides in **union list state** (the primitive Flink redistributes to every subtask on rescale); on restore each new subtask computes its `KeyGroupRange` and **unions the old shards intersecting it, projecting each to the overlap** (`CloneBuilder.withSource`) — RFC-0004 union+projection **driven by the redistributed savepoint state**. Result: every key counted **exactly 9** (3 runs × 3 rounds) across both rescales — exactly-once preserved. This graduates §6.4 rescale from "algorithm verified standalone + inferred-in-Flink" to **verified fused with the real Flink savepoint/rescale lifecycle**. Scope: single-JVM MiniCluster on `file:///`; real-S3/multi-node scale still unproven. Added README §16.18, updated §16.5, journal scorecard (18).
+
 ---
 
-## Final test scorecard (17 tests, all passing — laptop/MiniCluster only)
+## Final test scorecard (18 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
 |---|---|---|
@@ -486,6 +489,7 @@ both valuable:
 | `SlateDbMergeSplitE2E` | §16.17 RFC-0004 projection split + union merge (600 keys intact, merged DB writable) | ✅ |
 | `SlateDbFencingE2E` | §18.9 2nd writer fences 1st → Error.Closed{reason=FENCED} | ✅ |
 | `SlateDbTtlE2E` | §18.6 native TTL: ⚡ lazy compaction-reclaim, NOT read-time expiry (corrected a wrong correction) | ✅ |
+| `FlinkRescaleSavepointE2E` | ⭐ §16.18 REAL Flink savepoint→P2→P4→P1 rescale fused w/ SlateDB projection+union; exactly-once | ✅ |
 | `slatedb-jna-j11` | §17 Java-22 floor is removable — JNA binding, real ops + checkpoint on JDK 11/17/25 | ✅ |
 
 ## Bugs / corrections that only RUNNING surfaced (⚡)
@@ -513,8 +517,10 @@ both valuable:
 - §8 L0 write-stall backpressure (never overwhelmed compaction).
 - §9/§9A memory footprint / silent OOM / no-spill / disk contention. (Compaction GC / space-reclaim timing IS
   now verified — §16.13 — but memory OOM and disk-cache contention remain unmeasured.)
-- §14 resharding (changing N).
-- Real parallel savepoint→rescale-across-restart (algorithm + parallel operation tested separately, not fused).
+- §14 resharding (changing N / maxParallelism).
+- ~~Real parallel savepoint→rescale-across-restart (algorithm + parallel operation tested separately, not fused).~~
+  ✅ **NOW VERIFIED — §16.18 / `FlinkRescaleSavepointE2E`**: real MiniCluster savepoint→P2→P4→P1 rescale fused
+  with SlateDB projection(upscale)+union(downscale), exactly-once (every key=9). Only real-S3/multi-node scale remains.
 - All §11 operational risks: S3 tail latency (p99/p999), request cost, pre-1.0 on-disk format stability,
   failover fencing under real concurrency.
 
