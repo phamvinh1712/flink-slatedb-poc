@@ -445,14 +445,28 @@ observability, checkpoint lifecycle) never prompted. Material gaps found:
   — §15.3 was wrong; `await_durable=true` NOT mandatory for exactly-once (barrier-flush is the durability
   point) — §7.3 overstated. Plus: `withWalObjectStore` bound (WAL-on-S3-Express latency fix), `CloseReason.Fenced`
   error contract, CDC/`WalReader` shipped in binding, wall-clock-only TTL (no event-time; `clock` not injectable).
-Folded everything into **README §18** (11 sub-items, each tagged [VERIFIED] vs [RFC]) + inline corrections to
+Folded everything into **README §18** (12 sub-items, each tagged [VERIFIED] vs [RFC]) + inline corrections to
 §7.3/§15.3 + two new §11 risk rows + two new §12 open-questions. This phase found gaps by *reading*, and the
 most important ones were then confirmed against source — the same verify-don't-assert discipline, applied to
 completeness rather than a single claim.
 
+**Q: "from rfc sweep, is there something you're not confident about and should verify from actual test?" →
+"yes"**
+Two sweep claims backed doc changes, so I tested them (`SlateDbTtlE2E`, `SlateDbFencingE2E`) — opposite outcomes,
+both valuable:
+- ✅ **Fencing (§18.9) — CONFIRMED as written.** 2nd writer on the same path fences the 1st; the 1st's next
+  write throws `Error.Closed{reason=FENCED, "detected newer DB client"}`. The operator's dead-handle signal is real.
+- ⚡ **TTL (§18.6) — CORRECTED; the sweep AND my first doc-fix were both wrong.** I'd written "SlateDB filters
+  expired rows on read." Running showed it does NOT: a point-`get` after the TTL still returns the value; expiry
+  only takes effect when a compaction *merge* rewrites the SST (confirmed by forcing a merge → then NULL). So
+  TTL is **lazy compaction-reclamation, not read-time expiry** — a Flink cold tier must still filter expiry
+  itself. This is the **second** reasoned "correction" the tests caught wrong (cf. the abandoned
+  compaction-non-blocking test): reading finds candidates, running finds truth. Rewrote §18.6/§15.3 accordingly;
+  added §18.12 recording both graduations.
+
 ---
 
-## Final test scorecard (15 tests, all passing — laptop/MiniCluster only)
+## Final test scorecard (17 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
 |---|---|---|
@@ -470,6 +484,8 @@ completeness rather than a single claim.
 | `ReadYourWritesE2E` | §16.15 read-your-writes consistent before any flush (put/overwrite/delete/RMW/scan) | ✅ |
 | `FlinkSerdeSlateDbE2E` | §16.16 Flink TypeSerializer ⇄ SlateDB byte[] (PojoSerializer round-trips objects + RMW) | ✅ |
 | `SlateDbMergeSplitE2E` | §16.17 RFC-0004 projection split + union merge (600 keys intact, merged DB writable) | ✅ |
+| `SlateDbFencingE2E` | §18.9 2nd writer fences 1st → Error.Closed{reason=FENCED} | ✅ |
+| `SlateDbTtlE2E` | §18.6 native TTL: ⚡ lazy compaction-reclaim, NOT read-time expiry (corrected a wrong correction) | ✅ |
 | `slatedb-jna-j11` | §17 Java-22 floor is removable — JNA binding, real ops + checkpoint on JDK 11/17/25 | ✅ |
 
 ## Bugs / corrections that only RUNNING surfaced (⚡)
