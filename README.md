@@ -91,6 +91,11 @@ mvn -q exec:java -Djna.library.path="$PWD/native"
 
 ## Results (verified on this machine)
 
+⭐ **Full JDK-25 sweep (2026-07):** EVERY test below runs green on **Temurin 25.0.3** — both Flink versions
+(1.20.1 + 2.3.0) and all SlateDB/e2e tests — with `--add-opens` flags. This fully backs §16.3: in-process
+SlateDB (FFM, needs JDK 22+) + Flink coexist on one modern JVM. (JDK 25 is *empirically working* but *officially
+unsupported* by Flink — 2.3 docs still cap at 17/21; §16.3.)
+
 ```
 flink-1.20-poc     → ALL CHECKS PASSED ✅  (Flink 1.20.1, JDK 11 and JDK 25)
 flink-2.3-poc      → ALL CHECKS PASSED ✅  (Flink 2.3.0,  JDK 17 and JDK 25)
@@ -110,7 +115,7 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      TTL PASSED ✅  (§18.6 native TTL — ⚡ FOUND: lazy compaction-reclaim, NOT read-time expiry; corrected a wrong "correction")
                      FENCING PASSED ✅  (§18.9 2nd writer fences 1st → Error.Closed{reason=FENCED} "detected newer DB client")
                      RESCALE+SAVEPOINT PASSED ✅  (§16.18 REAL Flink savepoint→P2→P4→P1 rescale fused w/ SlateDB projection+union; exactly-once, every key=9)
-slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 real ops + checkpoint on JDK 11, 17, AND 25 — no FFM, no flags)
+slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 FALLBACK-ONLY — for platforms hard-pinned to JDK 11/17; not needed if you can run JDK 22+)
 ```
 
 Untested (need real infra/load, not a MiniCluster): §8 L0 write-stall backpressure, §9/§9A memory-OOM/disk,
@@ -1325,12 +1330,21 @@ after `put` + `flush()` + `createDetachedCheckpoint()`, a checkpoint-pinned read
 
 ### 16.3 FINDING (correction to earlier "showstopper") — Flink runs on JDK 22+
 The Java-version conflict (SlateDB needs Java 22+ FFM; Flink officially supports ≤17/21) is **real but
-surmountable**. Verified: Flink **1.20.1 AND 2.3.0 both run on JDK 25** (MiniCluster, all checks pass) with
-`--add-opens java.base/{util,lang,time}=ALL-UNNAMED`, and SlateDB's native lib loads on the same JVM. So
-**in-process SlateDB + Flink IS possible** — run the whole cluster on JDK 22+. Caveat: officially unsupported
-by Flink; validate under real load. (Earlier drafts called this a showstopper based on stock-image JVMs — corrected.)
-**And the floor itself is removable — see §17:** regenerating the binding with UniFFI's Kotlin/JNA backend
-runs SlateDB on **JDK 11/17/25** (proven by `slatedb-jna-j11`), at the cost of maintaining a binding fork.
+surmountable**. **⭐ Verified 2026-07: EVERY test in this PoC runs green on JDK 25** — not just the FFM ones.
+The full sweep on **Temurin 25.0.3**: `flink-1.20-poc` (Flink 1.20.1) ✅, `flink-2.3-poc` (Flink 2.3.0, incl.
+async-state runtime enforcement) ✅, `slatedb-verify` ✅, and all 15 `flink-slatedb-e2e` mains ✅ (clone-restore,
+real recovery, rescale, **savepoint→rescale fusion §16.18**, hybrid tiering, P=4 parallel, compaction, TTL,
+merge/split, fencing, serde, read-your-writes). Both Flink versions compile *and* run on JDK 25 with
+`--add-opens java.base/{util,lang,time,util.concurrent}=ALL-UNNAMED`, and SlateDB's FFM native lib loads on the
+same JVM. So **in-process SlateDB + Flink IS possible** — run the whole cluster on JDK 22+.
+**Caveat (verified against upstream docs 2026-07):** JDK 25 is **officially unsupported** by Flink — the Flink
+2.3.0 [Java compatibility page](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/deployment/java_compatibility/)
+still lists **Java 17 (default/recommended)** and **Java 21 (experimental)** only, no Java 25. So this is
+*empirically works* ≠ *supported*; validate under real load and pin your JVM. (Earlier drafts called the
+version conflict a showstopper based on stock-image JVMs — corrected.)
+**The floor is also removable if you're hard-pinned below 22 — see §17:** the Kotlin/JNA binding runs SlateDB on
+**JDK 11/17/25** (`slatedb-jna-j11`). *Given the JDK-25 result above, the FFM binding on JDK 22+ is the
+recommended path; the JNA fork is only for platforms that refuse JDK 22+.*
 
 ### 16.4 Confirmed empirically
 - §12.8 clone-from-checkpoint excludes post-checkpoint writes AND retains pre-checkpoint data (exactly-once sound, given §16.2 memtable flush).
@@ -1499,6 +1513,11 @@ This graduates the §6.4 rescale from "algorithm verified standalone + inferred-
 ---
 
 ## 17. The Java-22 floor is a PACKAGING choice, not a SlateDB limit (`slatedb-jna-j11`)
+
+> **⚠️ FALLBACK-ONLY (as of the 2026-07 JDK-25 sweep).** §16.3 now verifies **all 18 tests run green on JDK 25**
+> with the stock FFM binding — Flink 1.20 *and* 2.3 included. **So the recommended path is the official FFM
+> binding on JDK 22+**, and this section (and the `slatedb-jna-j11` module) is relevant **only if your platform
+> is hard-pinned to JDK 11/17** and cannot run JDK 22+. If you control the JVM, skip §17 entirely.
 
 §16.3 established that Flink runs on JDK 22+, so the FFM binding's Java-22 floor is *tolerable*. This section
 goes further and shows the floor is **removable**: the same SlateDB native library runs on **JDK 11, 17, and

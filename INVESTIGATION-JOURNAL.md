@@ -469,6 +469,32 @@ both valuable:
 
 ---
 
+## Phase 13 — Full JDK-25 sweep + Flink-2.3-supports-25 fact-check
+
+**Q: "i think flink 2.3 now support java 25, can you verify?"**
+Checked the live Flink docs (not memory — 2.3.0 released 2026-06-25, after my Jan-2026 cutoff). **Verdict: NO.**
+The Flink 2.3.0 [Java compatibility page] lists **Java 17 (default/recommended)** and **Java 21 (experimental)**
+only — no Java 25. 2.3.0 is the current latest release, so the page is up to date. So "Flink 2.3 supports 25" is
+wrong. The doc's §0/§16.3 stance ("runs on 25 but officially unsupported") was already correct — the likely
+confusion was conflating the empirical §16.3 result (it *runs*) with official support (it doesn't).
+
+**Q: "can you try to use java 25 for all of the tests to verify" → then "if all pass, remove jna-j11..." →
+clarified to "keep it, just demote"**
+Ran **every** runnable test on Temurin 25.0.3 (recompiled the two Flink modules on JDK 25 too). **All green:**
+`flink-1.20-poc` (Flink 1.20.1) ✅, `flink-2.3-poc` (Flink 2.3.0, incl. async-state runtime enforcement) ✅,
+`slatedb-verify` ✅, and 13 e2e mains run ✅ (FlinkSlateDbE2E, Serde, ReadYourWrites, HybridTiering,
+ShardPerBucketParallel×4, Recovery, RescaleSavepoint, Rescale, Fencing, TTL, MergeSplit, Compaction) — GcLong
+(~17min) + MarshalBench not re-run but have only ever run on 25. Needed `--add-opens java.base/{util,lang,time,
+util.concurrent}=ALL-UNNAMED`. This fully backs §16.3: previously only the FFM/SlateDB tests were confirmed on
+25; now the pure-Flink modules are too.
+Consequence: since the FFM binding on JDK 25 is now fully validated, **demoted §17/`slatedb-jna-j11` to
+FALLBACK-ONLY** (only for platforms hard-pinned below JDK 22). Did NOT delete it — the JDK-11/17-pinned escape
+hatch is a *different* case than "runs on 25," so the knowledge + runnable proof are kept, just clearly marked
+as not-the-recommended-path. Added the dated JDK-25-sweep banner + upstream-docs citation to §16.3 and the
+results block; §17 gets a fallback-only banner.
+
+---
+
 ## Final test scorecard (18 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
