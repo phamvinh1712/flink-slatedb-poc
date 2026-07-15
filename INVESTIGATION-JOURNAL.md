@@ -422,6 +422,36 @@ scan-copy). Added README §6.4 note + §16.17.
 
 ---
 
+## Phase 12 — Systematic RFC gap sweep (all 28 RFCs)
+
+**Q: "look through each of the rfc in rfcs folder of slatedb and verify if there is any potential gaps you're
+missing"** → **"a"** (fold into the design doc)
+Fanned out **6 parallel readers** over all 28 RFCs, each cross-checking against the design-doc outline; one
+stalled so its 5 RFCs were covered from source directly. Every load-bearing finding was **re-verified against
+v0.14.1 source / the JAR (`javap`)** before writing — not taken on the agents' word. The sweep confirmed the
+doc had exactly the blind spots a question-driven doc would: whole capability areas (object-store requirements,
+observability, checkpoint lifecycle) never prompted. Material gaps found:
+- ⚠️ **Conditional-write requirement** (RFC 0001, VERIFIED in txn-obj source: `put_if_not_exists`/`If-Match`) —
+  manifest CAS + fencing + exactly-once all silently require an object store with conditional PUT (S3 only since
+  Aug-2024); never stated, never tested (only `file://`/`memory://`). The headline gap.
+- **Detached-checkpoint lifecycle** (0004/0005) — expiry → unrestorable Flink checkpoint; no-expiry → leak; no
+  `Db::destroy` for old generations; iterator invalidation can truncate a rescale scan-copy.
+- **Big-endian key-group prefix** (0016 rejected → bytewise-lexical forever) — never stated; rescale/projection
+  silently break otherwise.
+- **Segment-oriented compaction** (0024, VERIFIED `withSegmentExtractor` bound) — a 3rd layout option that
+  attacks the N/P trap; §4 omitted it.
+- **No observability plan** (0021, VERIFIED `DefaultMetricsRecorder` bound) — doc names risks, not the metrics.
+- **Corrections:** TTL cleanup DOES work from Java (`putWithOptions(ttl)` bound + built-in TTL filter; VERIFIED)
+  — §15.3 was wrong; `await_durable=true` NOT mandatory for exactly-once (barrier-flush is the durability
+  point) — §7.3 overstated. Plus: `withWalObjectStore` bound (WAL-on-S3-Express latency fix), `CloseReason.Fenced`
+  error contract, CDC/`WalReader` shipped in binding, wall-clock-only TTL (no event-time; `clock` not injectable).
+Folded everything into **README §18** (11 sub-items, each tagged [VERIFIED] vs [RFC]) + inline corrections to
+§7.3/§15.3 + two new §11 risk rows + two new §12 open-questions. This phase found gaps by *reading*, and the
+most important ones were then confirmed against source — the same verify-don't-assert discipline, applied to
+completeness rather than a single claim.
+
+---
+
 ## Final test scorecard (15 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
