@@ -1254,6 +1254,46 @@ Rule of thumb:
 - **Bucket size** = key groups per shard (→ N). Changeable (§14.1 free, or §14.3 offline).
 - **`maxParallelism`** = total key-group count. **Fix generously once, never change** — changing it rehashes every key (full rebuild, not a reshard). Set high up front (e.g. 4096/32768) so you never need to. Key groups are the fixed atomic unit; resharding only redraws bucket boundaries *over* them — it never splits within a key group.
 
+
+```
+  "Change bucket size" (key groups per shard, = N). Cost is decided by ONE design
+  choice: is bucket size PHYSICAL (baked into DBs) or LOGICAL (a routing knob)?
+
+  maxParallelism = 32768 key groups  ── the fixed atomic unit, never changes ──
+
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║  [BEST] §14.1  FINE-FIXED PHYSICAL SHARDS  →  bucket size = LOGICAL grouping         ║
+╟──────────────────────────────────────────────────────────────────────────────────────╢
+║   physical layer (chosen ONCE, immutable): 512 small SlateDBs                        ║
+║     shard0  shard1  shard2  …  shard511      (each = 64 key groups, fixed)           ║
+║        └── each physical shard = a fixed slice of key groups, NEVER re-split         ║
+║                                                                                      ║
+║   bucket size = how many shards a subtask opens (a MAP, not a layout):               ║
+║     before  P=4 :  s0={0..127}  s1={128..255}  s2=…  s3=…   (128 shards each)        ║
+║     after   P=8 :  s0={0..63}   s1={64..127}   …            (64 shards each)         ║
+║                    ▲ recompute shard→subtask map, re-open. NO data moved.            ║
+║   → "change bucket size" == rescale (§16.18): re-map + restart. ~ZERO cost.          ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  [COST] §14.3  COARSE PHYSICAL SHARDS  →  bucket size BAKED IN  → offline reshard    │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│   physical layer = the buckets themselves (e.g. 4 big DBs = 4 buckets)               │
+│     dbA[0..8191]  dbB[8192..16383]  dbC[…]  dbD[…]                                   │
+│                                                                                      │
+│   to change bucket size you must PHYSICALLY split/merge DBs (a migration):           │
+│     1. Flink savepoint (quiesce)     4. rewrite shard map                            │
+│     2. detached checkpoint / shard   5. restore against new map                      │
+│     3. SPLIT = clone+projection       6. reference-aware GC (§6.5)                   │
+│        MERGE = union (§16.17)          !! storage transiently GROWS (shared          │
+│                                          SSTs until child compaction, §14.2)         │
+│   → maintenance window, real byte movement on merge, no range-delete to prune        │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+
+  RULE: resharding only redraws bucket boundaries OVER key groups — never splits
+  within a key group. So set physical granularity fine + maxParallelism high NOW.
+```
+
 ### 14.1 Recommended: decouple *logical shard* from *physical DB* → resharding is free
 
 **Don't make bucket size a physical property.** Choose a **fine, fixed physical shard granularity once** (many small physical SlateDBs, each = a small fixed bucket of key groups — e.g. 512–1024 physical shards) and **never physically reshard.** Then "bucket size" is a **routing-layer knob**: how many physical shards a subtask opens.
