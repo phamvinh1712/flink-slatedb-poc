@@ -719,7 +719,48 @@ void initializeState(...) { /* MUST clone-from-pinned-checkpoint, NOT plain writ
 - **DB naming:** name by a stable identity (`s3://bucket/<jobId>/<operatorUid>/<uuid>/`), **NOT by `subtaskIndex`** (reassigned on rescale).
 
 ### 6.4 Rescale (one-DB-per-subtask case)
-Emulates `RocksDBIncrementalRestoreOperation.restoreWithRescaling`:
+
+Rescale happens **only at savepoint→restore** (never live). Each subtask's SlateDB handle rides in Flink **union list state**; on restore every subtask receives the full list and rebuilds its DB from the old shards intersecting its new key-group range — **upscale = projection (split), downscale = union (merge)**. The lifecycle, exactly as `FlinkRescaleSavepointE2E` (§16.18) ran it:
+
+```
+  maxParallelism = 128 key groups (FIXED forever). Each subtask owns a contiguous
+  KeyGroupRange; one SlateDB per subtask. Rescale happens ONLY at savepoint→restore.
+
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  RUN 1   parallelism = 2                                                             │
+│    subtask0  kg[  0.. 63]  → db-p2-s0     subtask1  kg[ 64..127] → db-p2-s1          │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+        │ stop-with-savepoint  → each subtask: flush memtable→L0, createDetachedCheckpoint,
+        │                         write "dbPath|cpId|kgLo|kgHi" into UNION LIST STATE
+        ▼
+   savepoint  holds union-list = [ (db-p2-s0, cp, 0-63), (db-p2-s1, cp, 64-127) ]
+        │  restore at NEW parallelism → Flink hands EVERY subtask the FULL list
+        ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  RUN 2   parallelism = 4     UPSCALE — each new subtask PROJECTS its slice           │
+│    s0 kg[ 0-31] ← project db-p2-s0 to [0,31]      (old s0 [0-63] ⊇ new)              │
+│    s1 kg[32-63] ← project db-p2-s0 to [32,63]     (old s0 split in two)              │
+│    s2 kg[64-95] ← project db-p2-s1 to [64,95]     (old s1 [64-127] ⊇ new)            │
+│    s3 kg[96-127]← project db-p2-s1 to [96,127]    (old s1 split in two)              │
+│    → 1 old shard feeds 2 new subtasks; each clones+clips (shallow, no copy)          │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+        │ stop-with-savepoint  (4 handles now in union list)
+        ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  RUN 3   parallelism = 1     DOWNSCALE — the one subtask UNIONS all it owns          │
+│    s0 kg[0-127] ← union( db-p4-s0[0-31], db-p4-s1[32-63],                            │
+│                          db-p4-s2[64-95], db-p4-s3[96-127] )                         │
+│    → 4 old shards → 1 new DB (withSource ×4); ranges adjacent+non-overlapping        │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+
+  Invariants (why it's correct & exactly-once, §16.18):
+   • each key group owned by exactly ONE old subtask → clean partition, no merge conflict
+   • ranges contiguous+adjacent by construction (big-endian kg prefix, §18.3) → union legal
+   • cpId rides in the SAME Flink checkpoint as the data → restore aligns state to that point
+   • upscale = split one shard (projection); downscale = merge many (union)
+```
+
+The manual scan-copy version below predates the projection/union path (§16.17); it still works and is what `SlateDbRescaleE2E` used, but **the projection/union approach above (§16.18) is cleaner — no byte copy.** Emulates `RocksDBIncrementalRestoreOperation.restoreWithRescaling`:
 ```java
 KeyGroupRange target = computeKeyGroupRangeForOperatorIndex(maxP, newP, subtaskIndex);
 List<Handle> sources = allHandles.filter(h -> intersects(h.range, target));  // from union state
