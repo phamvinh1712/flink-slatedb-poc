@@ -1492,6 +1492,54 @@ Verifies §6.1a: store Java objects in SlateDB the way Flink's RocksDB backend d
 
 ### 16.17 DB SPLIT + MERGE via RFC-0004 projection & union (`SlateDbMergeSplitE2E`)
 
+**How it works** — projection/union operate on the **manifest** (the metadata listing SSTs + their key ranges), not on the data. Both are *shallow*: no bytes move; the new DB references the parent's physical SSTs via `external_dbs` + a pinning checkpoint until a later compaction rewrites them.
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│  SOURCE manifest      keyspace a…z      (SSTs = physical files in object store)    │
+│    L0 :  [sstA  a‥m]   [sstB  k‥z]                 (L0 may overlap)                │
+│    SR1:  [sstC a‥f][sstD f‥p][sstE p‥z]           (sorted run: non-overlapping)    │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+  ══════════════  PROJECTION  (= SPLIT) ══════════════   shallow: NO data copied
+        project to [a,k)                     project to [k,z]
+               │                                    │
+               ▼                                    ▼
+┌─────────────────────────────────────┐   ┌─────────────────────────────────────┐
+│  shard-lo   visible=[a,k)           │   │  shard-hi   visible=[k,z]           │
+│  L0 : sstA → clip [a,k)             │   │  L0 : sstA → clip [k,m]             │
+│       sstB  EXCLUDED (k‥z)          │   │       sstB → clip [k,z]             │
+│  SR1: sstC[a‥f] sstD→[f,k)          │   │  SR1: sstD→[k,p] sstE[p‥z]          │
+│       sstE  EXCLUDED                │   │       sstC  EXCLUDED                │
+│  external_dbs → SOURCE              │   │  external_dbs → SOURCE              │
+│     {sstA,sstC,sstD}+ckpt           │   │     {sstA,sstB,sstD,sstE}+ckpt      │
+└─────────────────────────────────────┘   └─────────────────────────────────────┘
+
+  • SST fully outside range → dropped from the view.  • SST straddling the
+    boundary → kept with a visible_range clip (reads/writes outside it fail).
+  • Both shards still POINT AT the source's physical SSTs (external_dbs) + a
+    pinning checkpoint so the source's files can't be GC'd. Zero bytes copied.
+
+  ══════════════  UNION  (= MERGE) ══════════════   inverse of projection
+       shard-lo [a,k)          shard-hi [k,z]        (must be NON-OVERLAPPING
+             └───────────┬───────────┘                & ADJACENT; WAL flushed)
+                         ▼  validate ranges → merge
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│  MERGED manifest      keyspace a…z                                                 │
+│    L0 / SRs : all surviving views from BOTH inputs, in key order;                  │
+│               sorted-run ids REGENERATED (kept unique across sources)              │
+│    external_dbs : union of both, DEDUPED by (path, source_checkpoint_id)           │
+│                   → SOURCE {sstA,sstB,sstC,sstD,sstE}   (shared, 1 entry)          │
+│    last_l0_seq  : max(lo, hi)   ← new writes get higher seq (MVCC safe)            │
+│    initialized  : false → caller finalizes checkpoints, then true                  │
+└────────────────────────────────────────────────────────────────────────────────────┘
+       │  still references SOURCE's SSTs; a later compaction rewrites them
+       ▼  into the merged DB's own files, after which the parent refs drop.
+```
+
+- **Projection (split)** filters to a key range: SSTs fully outside are dropped; a straddling SST is kept with a `visible_range` clip (reads/writes outside fail). The upscale primitive (§16.18).
+- **Union (merge)** combines **non-overlapping + adjacent** manifests: copies surviving views in key order (regenerating sorted-run ids), dedupes `external_dbs` by `(path, source_checkpoint_id)`, sets `last_l0_seq=max` so new writes get higher MVCC seq. The downscale primitive (§16.18). ⚠️ each source's WAL must be flushed to L0 first (union can't merge WAL state).
+
 Verifies the RFC-0004 rescale primitives (§6.4) end-to-end — the actual **union** path, which `SlateDbRescaleE2E` (§16.9) left as a manual scan-copy. Populated a 600-key DB (flushed to L0), then:
 - **SPLIT via projection** — cloned the source twice with `CloneBuilder.withProjectionRange`: `shard-lo`=[key-000000, key-000300), `shard-hi`=[key-000300, key-000599]. ✅ Each shard has **exactly its half** (300 keys, 0 wrong, nothing leaked across the boundary — projection physically clips).
 - **MERGE via union** — cloned from **two sources** (`createCloneBuilderFromSource(lo)` + `withSource(hi)`, each carrying its own `KeyRange`). ✅ The merged DB has **all 600 keys with correct values**, is **writable** (new `key-000600` landed), and serves keys from both shards live.
