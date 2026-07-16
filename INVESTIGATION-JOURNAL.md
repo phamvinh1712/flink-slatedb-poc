@@ -493,9 +493,22 @@ hatch is a *different* case than "runs on 25," so the knowledge + runnable proof
 as not-the-recommended-path. Added the dated JDK-25-sweep banner + upstream-docs citation to §16.3 and the
 results block; §17 gets a fallback-only banner.
 
+**Q: "how does slatedb decide which records to evict from cache?" → "what metrics does slatedb expose, how to
+wire to flink?" → "a and b"**
+Eviction: corrected the premise — SlateDB evicts **blocks** (byte-weighted `CachedEntry`), not records; the
+algorithm is the backend's default (moka = W-TinyLFU, foyer = S3-FIFO — both scan-resistant), SlateDB sets only
+the weigher+capacity (verified in `db_cache/{moka,foyer}.rs`). Metrics: built `SlateDbMetricsE2E` — wired a
+`DefaultMetricsRecorder` (default is no-op!), did work, dumped `snapshot()`. ⚡ Discovered the **real 0.14.1
+catalog: 43 metric names / 125 label-series** — and several RFC-quoted names in the sweep were WRONG (e.g.
+S3 latency is `object_store.request_duration_seconds` histogram, not `db.request_duration_seconds`; cache is
+`db_cache.access_count{entry_kind,result}`). Wrote **§19 Observability** with the verified catalog + Flink
+`MetricGroup`-polling wiring code (per-subtask recorder → Flink's existing reporter); marked §18.5 CLOSED.
+Two compile fixes found by running: `snapshot()` returns an immutable list (copy before sort); `MetricValue`
+variants expose `.v1()`, not `.value()`. Another case of running correcting reading (the RFC metric names).
+
 ---
 
-## Final test scorecard (18 tests, all passing — laptop/MiniCluster only)
+## Final test scorecard (19 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
 |---|---|---|
@@ -516,6 +529,7 @@ results block; §17 gets a fallback-only banner.
 | `SlateDbFencingE2E` | §18.9 2nd writer fences 1st → Error.Closed{reason=FENCED} | ✅ |
 | `SlateDbTtlE2E` | §18.6 native TTL: ⚡ lazy compaction-reclaim, NOT read-time expiry (corrected a wrong correction) | ✅ |
 | `FlinkRescaleSavepointE2E` | ⭐ §16.18 REAL Flink savepoint→P2→P4→P1 rescale fused w/ SlateDB projection+union; exactly-once | ✅ |
+| `SlateDbMetricsE2E` | §19 DefaultMetricsRecorder captures 43 metric names / 125 series; real catalog + Flink wiring | ✅ |
 | `slatedb-jna-j11` | §17 Java-22 floor is removable — JNA binding, real ops + checkpoint on JDK 11/17/25 | ✅ |
 
 ## Bugs / corrections that only RUNNING surfaced (⚡)

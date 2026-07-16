@@ -115,6 +115,7 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      TTL PASSED ✅  (§18.6 native TTL — ⚡ FOUND: lazy compaction-reclaim, NOT read-time expiry; corrected a wrong "correction")
                      FENCING PASSED ✅  (§18.9 2nd writer fences 1st → Error.Closed{reason=FENCED} "detected newer DB client")
                      RESCALE+SAVEPOINT PASSED ✅  (§16.18 REAL Flink savepoint→P2→P4→P1 rescale fused w/ SlateDB projection+union; exactly-once, every key=9)
+                     METRICS PASSED ✅  (§19 DefaultMetricsRecorder captured 43 metric names/125 series; real catalog + Flink wiring)
 slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 FALLBACK-ONLY — for platforms hard-pinned to JDK 11/17; not needed if you can run JDK 22+)
 ```
 
@@ -1744,7 +1745,9 @@ Custom comparators were **rejected** → SlateDB is bytewise-lexicographic **per
 ### 18.4 Segment-oriented compaction — a missing third layout option (RFC 0024) — **[VERIFIED]** bound
 §4's layout analysis (shard-per-bucket vs one-DB-per-subtask) omits a third option that directly attacks the §4.1 N/P trap: **one physical DB per subtask, with each key-group bucket as a prefix-derived *segment*.** `withSegmentExtractor` is in the Java `DbBuilder` and `segments:[Segment]` is in the 0.14.1 manifest (§5C). Segments-in-one-DB collapse the per-instance multipliers (one manifest, one WAL, one memtable/unflushed buffer, one compactor coordinator, one connection pool per subtask — not N/P of each) while giving **per-segment L0 backpressure** (a hot bucket's stall no longer couples to cold ones) and **atomic segment drop (`DrainSegmentSpec`)** — a real answer to the §5.5/§6.4 "no range-delete" downscale-clip limitation. RFC 0024 itself argues segments beat N physical DBs for exactly the N/P reasons. Caveats: the extractor is **immutable at DB creation** (union requires identical `segment_extractor_name`); per-segment *retention scheduling* needs a custom (Rust) scheduler; segments do **not** relax single-writer (still one DB/writer per subtask). Amends §4.
 
-### 18.5 No observability / metrics plan (RFC 0021) — **[VERIFIED]** `DefaultMetricsRecorder` is bound
+### 18.5 No observability / metrics plan (RFC 0021) — **✅ NOW CLOSED → see §19** (verified catalog + Flink wiring, `SlateDbMetricsE2E`)
+> This gap is resolved: **§19** has the real 0.14.1 metric catalog (dumped by running, not RFC-guessed — several guessed names were wrong) plus Flink `MetricGroup` wiring code. The summary below is kept for context.
+
 The doc names every HIGH risk (L0 write-stall §8, silent OOM §9, S3 tail §11) but never lists the metrics to *watch* them. SlateDB ships a pluggable `MetricsRecorder`; **`DefaultMetricsRecorder` is in the binding** (verified: `metricByNameAndLabels(...)`, `metricsByName(...)`). Key metrics to scrape, mapped to risks — the same way you'd wire RocksDB/Flink metrics:
 - `slatedb.db.l0_sst_count` + `backpressure_count` → **write-stall proximity (§8)**
 - `slatedb.compactor.{last_compaction_timestamp_sec, running_compactions, total_throughput_bytes_per_sec}` → **compaction lag (§8/§16.13)**
@@ -1787,6 +1790,74 @@ Compaction non-blocking + backpressure (§7/§8), checkpoints/clone/projection/u
 The sweep was source-*reading*; two of its claims backed doc changes, so they were tested (`SlateDbTtlE2E`, `SlateDbFencingE2E`):
 - **§18.9 fencing — CONFIRMED as written.** A 2nd writer on the same path fences the 1st; the 1st's next write throws `Error.Closed{reason=FENCED, message="detected newer DB client"}`. The Flink operator's dead-handle signal is real and identifiable.
 - **§18.6 TTL — CORRECTED (the sweep, and my first fix, were wrong).** Assumed "SlateDB filters expired rows on read." Running showed it does **not**: a point-`get` after expiry still returns the value; expiry only takes effect when a compaction *merge* rewrites the SST. TTL is lazy space-reclamation, not read-time expiry. This is the second time in the investigation a reasoned "correction" was itself caught wrong only by running (cf. the abandoned compaction-non-blocking test, §7.3) — reinforcing that reading finds candidates, running finds truth.
+
+---
+
+## 19. Observability — SlateDB metrics & wiring to Flink (✅ verified, `SlateDbMetricsE2E`)
+
+Closes the §18.5 gap. The metric names below are the **real 0.14.1 catalog** — dumped by running a wired `DefaultMetricsRecorder` and calling `snapshot()` (43 distinct names / 125 label-series), **not** the RFC-quoted guesses (several of which were wrong).
+
+**⚠️ The default recorder is no-op** — you get **zero metrics** unless you call `DbBuilder.withMetricsRecorder(...)`. (RFC-0021 removed the old `db.metrics()`.)
+
+### 19.1 The metric catalog that matters for Flink (verified names)
+
+| Metric (`slatedb.*`) | Type | Watches | Risk |
+|---|---|---|---|
+| `db.l0_sst_count` | gauge | L0 buildup → write-stall proximity | §8 |
+| `db.l0_stall_count{type}`, `db.backpressure_count` | counter | writes actually stalling | §8 |
+| `db.total_mem_size_bytes`, `db.wal_buffer_estimated_bytes` | gauge | native off-heap growth | §9 silent-OOM |
+| `db.write_ops`, `db.request_count{op}` | counter | write/read throughput (op = get/put/…) | — |
+| `db.wal_flush_bytes`, `db.l0_flush_bytes`, `db.immutable_memtable_flushes` | counter | flush volume/rate | §7 |
+| `db_cache.access_count{entry_kind,result=hit\|miss}` | counter | **block/meta cache hit rate** (8 series: block/index/filter/stats × hit/miss) | §9 |
+| `db.sst_filter_{positive,negative,false_positive}_count{kind}` | counter | bloom-filter effectiveness | §5B |
+| `compactor.running_compactions{worker_id}` | up-down | compaction concurrency / stuck | §8 |
+| `compactor.last_compaction_timestamp_sec`, `compactor.total_throughput_bytes_per_sec`, `compactor.bytes_compacted{worker_id}` | gauge/counter | **compaction lag** | §8, §16.13 |
+| `gc.deleted_count{resource}`, `gc.count` | counter | GC activity (§16.13) | — |
+| `object_store.request_count{api,component,op,store_type}` | counter | **S3 request volume → cost** | §11 |
+| `object_store.request_duration_seconds{…}` | **histogram** | **S3 latency incl. p99/p999 tail** (min/max/sum/count/buckets) | §11 |
+| `object_store.error_count{…}` | counter | S3 error rate / retries | §11 |
+
+(Full 43-name dump is in `SlateDbMetricsE2E` output. Note `object_store.request_duration_seconds` is the **histogram** — that's where the S3 tail-latency the doc worried about actually surfaces; the earlier RFC-guessed `db.request_duration_seconds` name was wrong.)
+
+### 19.2 Wiring into Flink — poll the snapshot into the operator's MetricGroup (recommended)
+
+`DefaultMetricsRecorder` is bound and has `snapshot()` / `metricByNameAndLabels(name, labels)` returning a `Metric` whose `.value()` is a sealed `MetricValue` (`Counter/Gauge/UpDownCounter` → `.v1()` is a `Long`; `Histogram.v1()` → `HistogramMetricValue{count,sum,min,max,boundaries,bucketCounts}`). Register Flink gauges that pull from it — Flink invokes them when its own reporter (Prometheus/JMX/etc.) scrapes, so SlateDB metrics flow through your existing Flink metrics pipeline, per subtask:
+
+```java
+// in open(): one recorder per subtask's DB
+DefaultMetricsRecorder rec = new DefaultMetricsRecorder();
+new DbBuilder(dbName, store).withMetricsRecorder(rec) /* ...settings... */;
+Db db = await(builder.build());
+
+MetricGroup mg = getRuntimeContext().getMetricGroup().addGroup("slatedb");
+mg.gauge("l0_sst_count",   () -> longOf(rec, "slatedb.db.l0_sst_count"));           // gauge
+mg.gauge("mem_size_bytes", () -> longOf(rec, "slatedb.db.total_mem_size_bytes"));   // gauge → OOM watch
+mg.gauge("backpressure",   () -> longOf(rec, "slatedb.db.backpressure_count"));     // counter → stall watch
+mg.gauge("compaction_age", () -> System.currentTimeMillis()/1000
+                                  - longOf(rec, "slatedb.compactor.last_compaction_timestamp_sec")); // lag(s)
+mg.gauge("cache_hit",  () -> labeled(rec, "slatedb.db_cache.access_count", "result","hit"));
+mg.gauge("cache_miss", () -> labeled(rec, "slatedb.db_cache.access_count", "result","miss"));
+
+static long longOf(DefaultMetricsRecorder r, String name) {
+    Metric m = r.metricByNameAndLabels(name, List.of());
+    if (m == null) return 0L;
+    MetricValue v = m.value();
+    if (v instanceof MetricValue.Gauge g)          return g.v1();
+    if (v instanceof MetricValue.Counter c)        return c.v1();
+    if (v instanceof MetricValue.UpDownCounter u)  return u.v1();
+    return 0L;
+}
+static long labeled(DefaultMetricsRecorder r, String name, String k, String val) {
+    Metric m = r.metricByNameAndLabels(name, List.of(new MetricLabel(k, val)));
+    return (m != null && m.value() instanceof MetricValue.Counter c) ? c.v1() : 0L;
+}
+```
+
+Because it's **one recorder per subtask** (one DB per subtask, §4), each subtask's metrics are auto-namespaced by Flink's subtask index — so you can spot a single hot/stalled subtask. For the S3-latency histogram, read `object_store.request_duration_seconds` and forward `hv.max()`/percentile buckets to a Flink histogram or gauge.
+
+**Alternative (push):** implement the `MetricsRecorder` interface yourself and forward each `registerCounter/Gauge/Histogram` to Flink `Counter`/`Gauge`/`Histogram` objects. More code; avoids polling but incurs the UniFFI callback hot-path cost RFC-0021 flags. The poll approach above is simpler and reuses Flink's scrape cadence.
+
+*Scope: verified the recorder captures the catalog and the snapshot/value API works over the binding (`SlateDbMetricsE2E`). The Flink-`MetricGroup` glue above is API-correct but not run inside a live Flink job here.*
 
 ---
 
