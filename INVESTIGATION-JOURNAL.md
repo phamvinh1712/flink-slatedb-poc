@@ -508,7 +508,43 @@ variants expose `.v1()`, not `.value()`. Another case of running correcting read
 
 ---
 
-## Final test scorecard (19 tests, all passing — laptop/MiniCluster only)
+## Phase 14 — Cache sharing, disk cache, and checkpoint-vs-savepoint reshard
+
+**Q: "can I share foyer cache between SlateDB instances?" → "yes, add a test"**
+Built `SlateDbSharedFoyerCacheE2E` (§16.20): one `DbCache.newFoyerCache(FoyerCacheOptions(64 MiB, 4))` passed to
+4 DBs via `withDbCache`. Adversarial probe — **same keys, different per-DB values** — and each DB read back its
+own (`crossContaminated=0`, cold+warm). Confirms `CachedKey{scope_id,...}` per-`Db` namespacing keeps a shared
+pool collision-safe for foyer (moka was already §16.12). This is the mechanism behind the §4.1/§9 memory
+mitigation. Had to shrink scale (4 DBs × 150 keys) — serial async round-trips are the throughput ceiling, not
+the cache.
+
+**Q: "how can I configure foyer cache disk directory?" → "what's the difference between CachedObjectStore and
+foyer?"**
+Dug into the uniffi binding source (`bindings/uniffi/src/db_cache.rs`) and found the honest answer: the binding
+exposes **only the memory-only `FoyerCache`** (`FoyerCacheOptions {maxCapacity, shards}` — no dir). The disk/
+hybrid tier (`FoyerHybridCache` + foyer's `FsDeviceBuilder`) is a **separate Rust type that is NOT bound** →
+unreachable from Java. So "put foyer on disk" isn't a thing from Java. The reachable local-SSD cache is a
+*different layer* — the **object-store cache** (`CachedObjectStore`), which mirrors raw SST *parts* at the
+object-store boundary (vs. foyer caching decoded blocks in the LSM read path). Configured via
+`object_store_cache_options.root_folder`. Built `SlateDbDiskCacheE2E` (§16.21): set root_folder from Java →
+SlateDB materialized **768 cache files** on disk, reads correct. **Corrected §9.1a** (it had implied foyer
+hybrid mode was pickable from Java — it isn't) and added §9.1b disambiguating the two caches.
+
+**Q: "can I reshard SlateDB during a checkpoint upgrade, or does it strictly need a savepoint?"**
+Built `FlinkRescaleCheckpointE2E` (§16.19). The answer is two layers: (1) SlateDB's projection/union reshard
+keys off SlateDB's *own* checkpoint IDs — savepoint vs. checkpoint is invisible to it; (2) Flink's rescale is
+the layer that mattered, and Flink **does** restore from a plain `RETAIN_ON_CANCELLATION` checkpoint at a new
+parallelism via the same `SavepointRestoreSettings.forPath`. Ran P2→P4→P1 with **no savepoint anywhere** —
+exactly-once (every key=9). ⚡ Two harness lessons from running: (a) with no logging backend + infinite restart,
+a restore failure loops *silently* — added `RestartStrategies.noRestart()` + surfaced the real throwable via
+`requestJobResult`; (b) the first runs read low (5/8 instead of 9) because I captured mid-drain — fixed by
+waiting **deterministically** for `DRAINED==P && PROCESSED==KEYS×ROUNDS` then the next checkpoint number, exactly
+what `stopWithSavepoint` does implicitly. Practical takeaway: rescaling does **not** force a savepoint; retained
+checkpoints suffice for same-version parallelism changes.
+
+---
+
+## Final test scorecard (22 tests, all passing — laptop/MiniCluster only)
 
 | Test | Verifies | Result |
 |---|---|---|
@@ -529,6 +565,9 @@ variants expose `.v1()`, not `.value()`. Another case of running correcting read
 | `SlateDbFencingE2E` | §18.9 2nd writer fences 1st → Error.Closed{reason=FENCED} | ✅ |
 | `SlateDbTtlE2E` | §18.6 native TTL: ⚡ lazy compaction-reclaim, NOT read-time expiry (corrected a wrong correction) | ✅ |
 | `FlinkRescaleSavepointE2E` | ⭐ §16.18 REAL Flink savepoint→P2→P4→P1 rescale fused w/ SlateDB projection+union; exactly-once | ✅ |
+| `FlinkRescaleCheckpointE2E` | ⭐ §16.19 REAL Flink RETAINED-CHECKPOINT→P2→P4→P1 rescale (NO savepoint); SlateDB union/projection; exactly-once | ✅ |
+| `SlateDbSharedFoyerCacheE2E` | §16.20 one FoyerCache backs 4 DBs, same keys/diff values → each reads its own (scope_id collision-safe) | ✅ |
+| `SlateDbDiskCacheE2E` | §16.21 object_store_cache_options.root_folder from Java → 768 SST cache files on local SSD; reads correct | ✅ |
 | `SlateDbMetricsE2E` | §19 DefaultMetricsRecorder captures 43 metric names / 125 series; real catalog + Flink wiring | ✅ |
 | `slatedb-jna-j11` | §17 Java-22 floor is removable — JNA binding, real ops + checkpoint on JDK 11/17/25 | ✅ |
 
@@ -557,10 +596,16 @@ variants expose `.v1()`, not `.value()`. Another case of running correcting read
 - §8 L0 write-stall backpressure (never overwhelmed compaction).
 - §9/§9A memory footprint / silent OOM / no-spill / disk contention. (Compaction GC / space-reclaim timing IS
   now verified — §16.13 — but memory OOM and disk-cache contention remain unmeasured.)
-- §14 resharding (changing N / maxParallelism).
+- §14 resharding **that changes maxParallelism** (changing N / key-group count). *(Rescale at FIXED
+  maxParallelism — changing operator parallelism — IS now verified, both from a savepoint §16.18 and a retained
+  checkpoint §16.19. Changing maxParallelism itself, which Flink forbids on restore, remains untested/unsupported.)*
 - ~~Real parallel savepoint→rescale-across-restart (algorithm + parallel operation tested separately, not fused).~~
   ✅ **NOW VERIFIED — §16.18 / `FlinkRescaleSavepointE2E`**: real MiniCluster savepoint→P2→P4→P1 rescale fused
-  with SlateDB projection(upscale)+union(downscale), exactly-once (every key=9). Only real-S3/multi-node scale remains.
+  with SlateDB projection(upscale)+union(downscale), exactly-once (every key=9).
+- ~~Whether rescale strictly needs a savepoint or also works from a checkpoint.~~
+  ✅ **NOW VERIFIED — §16.19 / `FlinkRescaleCheckpointE2E`**: a savepoint is **not** required — Flink reshards
+  from a plain `RETAIN_ON_CANCELLATION` checkpoint at a new parallelism (P2→P4→P1), SlateDB union/projection rides
+  on it, exactly-once (every key=9). Only real-S3/multi-node scale remains.
 - All §11 operational risks: S3 tail latency (p99/p999), request cost, pre-1.0 on-disk format stability,
   failover fencing under real concurrency.
 

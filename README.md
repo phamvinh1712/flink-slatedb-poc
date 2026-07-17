@@ -13,7 +13,7 @@ All modules have been run and **PASS** on this machine (see "Results" below).
 | `flink-1.20-poc` | Flink **1.20** design claims: §3 KeyGroupRange reconstruction, §0 `open(Configuration)` + deprecated-but-present RuntimeContext getters, §13.5 key-group ownership partition | JDK 11 | JDK 11 (also 25) |
 | `flink-2.3-poc` | Flink **2.3** claims: §0 `open(OpenContext)`, getTaskInfo()-only, §0/§15.2 `enableAsyncState()` exists **and** is runtime-enforced | JDK 17 | JDK 17 (also 25) |
 | `slatedb-verify` | SlateDB **correctness**: §12.8/§6.6 clone-from-checkpoint exactly-once (excludes post-checkpoint writes, retains pre-checkpoint), and the **§6.3 memtable-flush finding** | **JDK 22+** only | **JDK 22+** only |
-| `flink-slatedb-e2e` | **THE compositions** (5 mains): real Flink `KeyedProcessFunction` + SlateDB in ONE JVM — clone-restore exactly-once, real checkpoint+failure+recovery, §6.4 rescale merge, §13 hybrid tiering, §7 compaction, and §4/§4.1/§12.7 parallel shard-per-bucket (P=4) | **JDK 22+** | **JDK 22+** (Flink on JDK 25) |
+| `flink-slatedb-e2e` | **THE compositions** (19 mains): real Flink `KeyedProcessFunction` + SlateDB in ONE JVM — clone-restore exactly-once, real checkpoint+failure+recovery, §6.4 rescale merge (savepoint §16.18 **and** retained-checkpoint §16.19), §13 hybrid tiering, §7 compaction, §4/§4.1/§12.7 parallel shard-per-bucket (P=4), shared foyer cache (§16.20), local-disk cache (§16.21), serde, TTL, fencing, metrics | **JDK 22+** | **JDK 22+** (Flink on JDK 25) |
 | `slatedb-jna-j11` | §17: the Java-22 floor is a **packaging** choice — the SlateDB native lib runs on **JDK 11/17/25** via a regenerated **Kotlin/JNA** binding (real put/get + MEMTABLE flush + detached checkpoint) | JDK 11 | **JDK 11, 17, 25** |
 
 `slatedb-verify` and `flink-slatedb-e2e` require **JDK 22+ by necessity**: `io.slatedb:slatedb-uniffi:0.14.1`
@@ -115,15 +115,18 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      TTL PASSED ✅  (§18.6 native TTL — ⚡ FOUND: lazy compaction-reclaim, NOT read-time expiry; corrected a wrong "correction")
                      FENCING PASSED ✅  (§18.9 2nd writer fences 1st → Error.Closed{reason=FENCED} "detected newer DB client")
                      RESCALE+SAVEPOINT PASSED ✅  (§16.18 REAL Flink savepoint→P2→P4→P1 rescale fused w/ SlateDB projection+union; exactly-once, every key=9)
+                     RESCALE+CHECKPOINT PASSED ✅  (§16.19 REAL Flink RETAINED-CHECKPOINT→P2→P4→P1 rescale, NO savepoint; SlateDB union/projection; exactly-once, every key=9)
+                     SHARED-FOYER-CACHE PASSED ✅  (§16.20 one FoyerCache backs 4 DBs; same keys/diff values → each reads its own; scope_id collision-safe)
+                     DISK-CACHE PASSED ✅  (§16.21 object_store_cache_options.root_folder from Java → 768 SST cache files on local SSD; reads correct)
                      METRICS PASSED ✅  (§19 DefaultMetricsRecorder captured 43 metric names/125 series; real catalog + Flink wiring)
 slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 FALLBACK-ONLY — for platforms hard-pinned to JDK 11/17; not needed if you can run JDK 22+)
 ```
 
 Untested (need real infra/load, not a MiniCluster): §8 L0 write-stall backpressure, §9/§9A memory-OOM/disk,
 §14 resharding (changing maxParallelism), and all §11 operational risks (S3 tail latency, cost, pre-1.0 format
-stability, failover fencing under concurrency). *(Real savepoint→rescale→restore is now VERIFIED — §16.18 —
-fused with SlateDB projection/union on a MiniCluster, up+downscale, exactly-once; only real-S3/multi-node scale
-remains.)*
+stability, failover fencing under concurrency). *(Real rescale→restore is now VERIFIED both ways — from a
+**savepoint** (§16.18) and from a plain **retained checkpoint** (§16.19) — fused with SlateDB projection/union
+on a MiniCluster, up+downscale, exactly-once; only real-S3/multi-node scale remains.)*
 
 `flink-slatedb-e2e` has TWO mains:
 - `FlinkSlateDbE2E` — barrier-sentinel checkpoint + clone-restore (simpler).
@@ -993,14 +996,30 @@ The "block cache" above (`DbCache`) has **two interchangeable implementations**,
 | | **Foyer** (`newFoyerCache`) | **Moka** (`newMokaCache`) |
 |---|---|---|
 | Default? | ✅ **Yes** — `default_db_cache()` is foyer-backed (core `default = ["aws","foyer"]`) | No — opt-in via `DbCache.newMokaCache(...)` |
-| Tiering | **Hybrid: memory + local disk** (`FoyerHybridCache` with a disk device) — can spill cached blocks to NVMe instead of evicting | **Memory only** |
+| Tiering **from Java** | ⚠️ **Memory only.** The uniffi binding exposes `FoyerCacheOptions {maxCapacity, shards}` and constructs the **in-memory** `FoyerCache` — see §9.1b. | **Memory only** |
+| Tiering in Rust core | Rust core *also* has `FoyerHybridCache` (memory+disk NVMe), but it is **not bound** in slatedb-uniffi 0.14.1 | — |
 | Lineage | Rust-native, purpose-built for hybrid caching | Port of Java's Caffeine (W-TinyLFU eviction) |
 | Miss coalescing | dedup-aware `fetch` (concurrent misses for one key share a single load) | via the trait's default loader |
 
 **Which to pick for Flink:**
-- **Moka** — simplest, purely in-memory. Prefer it when you do **not** want SlateDB touching local disk (the §9A contention concern — e.g. a TaskManager where RocksDB is the hot tier in the §13 hybrid design). This is what `FlinkShardPerBucketParallelE2E` used (shared moka cache per subtask, §16.12).
-- **Foyer** — default; choose its **hybrid mode** when you want a large block cache that overflows to local NVMe rather than evicting hot blocks (trades §9A disk for fewer cold S3 reads). Adds a disk-space/IOPS cost — size it against everything else on that volume (§9A).
-- Either way the cache is **shareable across many DB instances** and collision-safe (§4.1, §12.7), which is what collapses the per-instance memory multiplier.
+- **Moka** — port of Caffeine, W-TinyLFU eviction, `time_to_live`/`time_to_idle` knobs. Prefer it when you want the idle/TTL eviction behavior. This is what `FlinkShardPerBucketParallelE2E` used (shared moka cache per subtask, §16.12).
+- **Foyer** — the default; also memory-only *as reachable from Java*. Fine for the common case (one bounded in-memory block cache per subtask).
+- **Neither foyer nor moka touches local disk from Java** — the hybrid/disk tier is a separate Rust type (`FoyerHybridCache`) not wired into the binding. If you want SlateDB's cache on local SSD, that's the **object-store disk cache** (a different layer), configured via `object_store_cache_options.root_folder` — see §9.1b + §9A + verified §16.21.
+- Either backend is **shareable across many DB instances** and collision-safe (§4.1, §12.7, verified for foyer in §16.20), which is what collapses the per-instance memory multiplier.
+
+### 9.1b Two different "disk caches" — don't confuse them (⚡ verified §16.20/§16.21)
+
+A recurring source of confusion, now pinned down against slatedb-uniffi 0.14.1 source + tests:
+
+| | **Foyer BLOCK cache** (`DbCache.newFoyerCache`) | **Object-store cache** (`object_store_cache_options`) |
+|---|---|---|
+| Layer | Caches **decoded SST blocks/index/filter** (post-parse, in the LSM read path), keyed by `CachedKey{scope_id, sst_id, block_id}` | Caches **raw SST *parts* / bytes** at the object-store boundary (a local mirror of S3 objects) |
+| On disk from Java? | ❌ **No** — memory only (`FoyerCacheOptions` has no dir; `FoyerHybridCache` unbound) | ✅ **Yes** — set `root_folder` to a path → SlateDB writes cache part-files there (§16.21: 768 files materialized) |
+| How to configure the dir | n/a (no disk tier reachable) | `settings.set("object_store_cache_options.root_folder", "\"/mnt/ssd/slatedb-cache\"")` |
+| Shareable across DBs? | ✅ yes, one `DbCache` → many `withDbCache(...)`, collision-safe (§16.20) | Each DB opens its own; the `root_folder` is per-DB (mind the §9A per-DB cap) |
+| Purpose | avoid re-reading+re-parsing hot blocks | avoid cold **S3 round-trips** by serving parts from local SSD |
+
+**So: "how do I put foyer's cache on disk?" → you don't (from Java).** To get SlateDB caching on local SSD, enable the **object-store disk cache** via `root_folder` (§9A, §16.21). The two caches are complementary layers — the object-store cache saves the S3 fetch; the foyer block cache saves the re-parse.
 
 ### 9.2 Which Flink memory section — NONE that Flink manages
 Flink TaskManager memory: `Total Process = JVM Heap + Managed Memory + Framework/Task Off-heap + Network + JVM Overhead + Metaspace`.
@@ -1036,8 +1055,8 @@ The mirror image of §9 (memory): SlateDB uses **almost no local disk by default
 | Path | Default | Local disk |
 |---|---|---|
 | Primary data (SSTs, WAL, manifest) | — | **None locally** — all in object storage. SlateDB's core premise; the durable path never touches local disk. |
-| Object-store disk cache (`object_store_cache_options`) | **OFF** (`root_folder = None`) | **0 by default.** When enabled, caches SST parts locally to avoid S3 reads. |
-| Foyer hybrid-cache disk tier | not configured | 0 unless you explicitly build a `FoyerHybridCache` with a disk device. |
+| Object-store disk cache (`object_store_cache_options`) | **OFF** (`root_folder = None`) | **0 by default.** When enabled (set `root_folder`), caches SST parts locally to avoid S3 reads. **This is the only local-disk cache reachable from Java** (verified §16.21). |
+| Foyer hybrid-cache disk tier | not configured | 0 — and **not reachable from the Java binding** in 0.14.1 (`FoyerHybridCache` is unbound; §9.1b). Rust-only. |
 
 **Object-store disk cache defaults (verified `impl Default for ObjectStoreCacheOptions`, source):**
 ```rust
@@ -1690,11 +1709,52 @@ Mechanism: a keyed RMW counter with SlateDB per subtask; a `CheckpointedFunction
 
 This graduates the §6.4 rescale from "algorithm verified standalone + inferred-in-Flink" to **verified end-to-end inside a real Flink savepoint/rescale cycle**. Scope/caveats: single-JVM MiniCluster on `file:///` (not real S3, not multi-node); the union runs inside `initializeState` synchronously (fine at this scale, but a large downscale union would extend restore time — the §18.2 checkpoint-lifetime and cold-start-warming concerns still apply at scale). Union preconditions held automatically because key-group ranges are contiguous, non-overlapping, and adjacent by construction (§6.1 big-endian prefix, §18.3).
 
+### 16.19 ⭐ RESHARD FROM A RETAINED CHECKPOINT — savepoint NOT required (`FlinkRescaleCheckpointE2E`)
+
+**Question answered:** *"Can I reshard SlateDB during a checkpoint upgrade, or does it strictly need a savepoint?"* → **A savepoint is not required.** Flink can rescale (change parallelism) while restoring from a plain **retained/externalized checkpoint**, and the SlateDB projection/union reshard rides on it identically to the savepoint case.
+
+Two independent layers, and separating them *is* the answer:
+1. **SlateDB's reshard** (RFC-0004 projection/union clone) keys off SlateDB's **own** checkpoint IDs. It has zero knowledge of whether Flink used a savepoint or a checkpoint — so it's a non-issue at that layer.
+2. **Flink's rescale-on-restore.** Savepoints were historically *the* rescale primitive, but Flink also restores from a retained checkpoint via the same `SavepointRestoreSettings.forPath(...)` path — and, because operator/keyed state is redistributed the same way, **at a different parallelism.** That's the layer this test exercises.
+
+Method (**no savepoint anywhere**): enable `RETAIN_ON_CANCELLATION` externalized checkpoints to a `file://` dir, run to a fully-drained + post-drain checkpoint, `cancelJob` (retaining the checkpoint), then restore the next run **from that `chk-N/_metadata`** at a new parallelism. Same union-list-state mechanism as §16.18.
+- **Run1 @ P=2** (fresh) → retained checkpoint.
+- **Run2 @ P=4** (UPSCALE, restored from cp1's `chk-N`): four subtasks each **projected** their slice from the two old DBs. ✅
+- **Run3 @ P=1** (DOWNSCALE, restored from cp2's `chk-N`): the single subtask **unioned all four** run2 DBs. ✅
+- **Verdict:** every key counted **exactly 9** (`k0=k7=k23=9`, wrong=0) — **exactly-once across upscale + downscale, driven entirely from retained checkpoints.**
+
+Test-harness note (why the first two runs read low then got fixed): capture must happen **after** the run is complete, exactly as `stopWithSavepoint` does implicitly. The final version blocks until (a) all source subtasks drained *and* (b) the counting operator `PROCESSED == KEYS×ROUNDS` elements (deterministic, since each SlateDB RMW is an async round-trip), then waits for the **next** checkpoint number strictly greater than the one present at drain — guaranteeing every increment is in the captured state. It also uses `RestartStrategies.noRestart()` so a restore/clone failure surfaces its real cause instead of silently looping.
+
+**Practical takeaway for Flink ops:** rescaling doesn't force a savepoint. Retained checkpoints (`execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION`) are restorable at a new parallelism, and the SlateDB reshard is identical. Savepoints remain preferable for *version-portable, format-stable* migrations (canonical format, cross-version), but for a same-version parallelism change a retained checkpoint is sufficient — and usually faster to produce. Scope/caveats: same as §16.18 (single-JVM MiniCluster, `file:///`, synchronous union in `initializeState`).
+
+### 16.20 SHARED FOYER CACHE across instances — collision-safe (`SlateDbSharedFoyerCacheE2E`)
+
+§16.12 proved a shared **moka** cache across 16 instances; this proves the same for **foyer** (the default backend) with a direct collision probe. Built **one** `DbCache.newFoyerCache(new FoyerCacheOptions(64 MiB, 4 shards))` and passed that **same instance** to `withDbCache(...)` on **4 separate DBs**. Then the adversarial part: wrote the **same key set** (`key-0..key-149`) into every DB but with **DB-specific values** (`d<db>-k<key>`), flushed each to SSTs (populating the shared cache), and read every key back from every DB — cold pass then warm pass.
+- **A. 4 DBs opened against one FoyerCache** ✅
+- **B. NO cross-contamination** — `crossContaminated=0`: each DB read back **its own** value even though all four share the cache and use identical keys. ✅
+- **C. all reads correct** through the shared cache (cold + warm) — `wrong=0 missing=0`. ✅
+
+This is the mechanism behind §4.1/§9's key memory mitigation: the block cache namespaces every entry by `CachedKey{scope_id, sst_id, block_id}` where `scope_id` is assigned per-`Db` (via `DbCacheWrapper`), so one bounded pool safely serves all shards on a subtask instead of `N/P × 512 MiB` of independent caches. Verified for **both** backends now (moka §16.12, foyer §16.20).
+
+### 16.21 LOCAL-DISK (object-store) CACHE directory from Java (`SlateDbDiskCacheE2E`)
+
+**Question answered:** *"How do I configure foyer's cache disk directory?"* → You configure the **object-store disk cache**, not foyer (§9.1b explains why: foyer's disk/hybrid tier is unbound in the Java binding; the reachable local-SSD cache is the object-store one). Set it via `Settings`:
+```java
+settings.set("object_store_cache_options.root_folder", "\"/mnt/ssd/slatedb-cache\"");
+settings.set("object_store_cache_options.cache_puts", "true");   // also cache writes (default false)
+```
+The test pointed `root_folder` at a temp dir, wrote+flushed 6 rounds of SSTs, read them back, and asserted SlateDB actually **materialized files** under the directory:
+- **A/B.** `root_folder` accepted, DB opened, cache dir created on disk. ✅ (settings JSON dump confirms the nested key was applied.)
+- **C.** SlateDB materialized **768 cache files** under `root_folder` (before=1 → after=768). ✅
+- **D.** reads correct through the disk-cached path (`k0=val-0-0`). ✅
+
+So the answer to "put SlateDB's cache on local SSD from Java" is `object_store_cache_options.root_folder` — subject to the §9A cautions (16 GiB **per-DB** default cap → set `max_cache_size_bytes` explicitly; soft cap driven by an hourly `scan_interval`; contends with RocksDB/Flink tmp on a shared volume).
+
 ---
 
 ## 17. The Java-22 floor is a PACKAGING choice, not a SlateDB limit (`slatedb-jna-j11`)
 
-> **⚠️ FALLBACK-ONLY (as of the 2026-07 JDK-25 sweep).** §16.3 now verifies **all 18 tests run green on JDK 25**
+> **⚠️ FALLBACK-ONLY (as of the 2026-07 JDK-25 sweep).** §16.3 now verifies **all e2e tests run green on JDK 25**
 > with the stock FFM binding — Flink 1.20 *and* 2.3 included. **So the recommended path is the official FFM
 > binding on JDK 22+**, and this section (and the `slatedb-jna-j11` module) is relevant **only if your platform
 > is hard-pinned to JDK 11/17** and cannot run JDK 22+. If you control the JVM, skip §17 entirely.
