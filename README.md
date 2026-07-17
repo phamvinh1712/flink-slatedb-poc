@@ -1021,6 +1021,37 @@ A recurring source of confusion, now pinned down against slatedb-uniffi 0.14.1 s
 
 **So: "how do I put foyer's cache on disk?" → you don't (from Java).** To get SlateDB caching on local SSD, enable the **object-store disk cache** via `root_folder` (§9A, §16.21). The two caches are complementary layers — the object-store cache saves the S3 fetch; the foyer block cache saves the re-parse.
 
+### 9.1c How a written record gets cached for reads — it's read-through, never write-through (⚡ verified in source)
+
+A common misconception: "my write goes into the cache so the next read is fast." **It does not.** The block cache (§9.1a) is a cache of **decoded SST blocks** keyed by `CachedKey{scope_id, sst_id, block_id}` — a brand-new write has no `sst_id` yet, so it *cannot* be a cache entry. Verified against 0.14.1 source: **nothing in the write / WAL / memtable / flush path ever calls `cache.insert`** (grepped `mem_table.rs`, `memtable_flusher.rs`, `wal_buffer.rs` — zero block-cache inserts). The **only** `cache.insert` is in `tablestore.rs::read_blocks_using_index`, on the SST **read** path.
+
+**The read path is a merged iterator, newest-first, and the in-memory tiers come *before* the cache** (`reader.rs::build_iterator_sources`):
+```
+write_batch → active memtable → immutable memtables → segments (L0 SSTs + sorted runs)
+   (newest) ──────────────────────────────────────────────────────────────► (oldest)
+                                                    └── ONLY this tier consults/populates the block cache
+```
+So a just-written record is served **directly from the memtable** and short-circuits before the SST/cache tier is ever touched — exactly the read-your-writes behavior verified in §16.15. The block cache plays **no role** for not-yet-flushed data.
+
+**A write's actual journey into the cache is lazy and read-driven:**
+```
+put ─► memtable (in-memory; served directly on read — NOT cached)
+        │  memtable flush at the checkpoint barrier (§6.3/§16.2)
+        ▼
+      L0 SST in object storage        (still not cached)
+        │  FIRST read that touches the block
+        ▼
+      object-store GET → decode block → cache.insert(CachedKey, block)   ◄── NOW cached
+        │
+        ▼
+      subsequent reads of that block → cache hit (no S3, no re-parse)
+```
+Point-gets (single block) take a dedup-aware `fetch_block` fast path — concurrent misses for the same block collapse onto one loader (`tablestore.rs:846`). Multi-block reads coalesce uncached blocks into one object-store GET per contiguous run, then insert them (`tablestore.rs:952`). Filters and index blocks follow the same read-through pattern.
+
+**Two consequences for the Flink design:**
+- **`cache_blocks` is a per-read knob** — exposed in Java as `ReadOptions.setCacheBlocks(false)`. A big range scan can read *without* polluting the cache (source comment: "read-only lookup that won't pollute the cache"), so a bulk scan doesn't evict your hot point-get working set.
+- **After a checkpoint flush (and after a rescale clone), the just-flushed hot keys are COLD in the block cache** until re-read from the new SST — the §18.2 cold-start / cache-warming concern. The binding exposes `Db.warmSst(ssTableId, List<CacheTarget>)` (and `evictCachedSst`) to pre-warm explicitly, but the **default is lazy** — the first post-flush read of each block pays the object-store round-trip. Budget for a cold-cache read spike right after every checkpoint barrier and every rescale restore.
+
 ### 9.2 Which Flink memory section — NONE that Flink manages
 Flink TaskManager memory: `Total Process = JVM Heap + Managed Memory + Framework/Task Off-heap + Network + JVM Overhead + Metaspace`.
 

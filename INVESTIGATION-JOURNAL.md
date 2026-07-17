@@ -542,6 +542,19 @@ waiting **deterministically** for `DRAINED==P && PROCESSED==KEYS×ROUNDS` then t
 what `stopWithSavepoint` does implicitly. Practical takeaway: rescaling does **not** force a savepoint; retained
 checkpoints suffice for same-version parallelism changes.
 
+**Q: "how are write records cached for read?"**
+Source-traced the read path (`reader.rs::build_iterator_sources` → `tablestore.rs::read_blocks_using_index`)
+and corrected the intuitive-but-wrong "writes populate the cache" model. The block cache is **read-through, never
+write-through**: nothing in the write/WAL/memtable/flush path calls `cache.insert` (grepped `mem_table.rs`,
+`memtable_flusher.rs`, `wal_buffer.rs` — zero inserts); the only `cache.insert` is on the SST read path
+(`tablestore.rs:952`). A fresh write is served from the **memtable** (read path is newest-first: write_batch →
+memtable → imm_memtable → SST segments; only the SST tier touches the cache), so it short-circuits before the
+cache — which is why §16.15 read-your-writes works with an empty cache. A record only becomes cached lazily:
+flush→SST→*first read of that block*→`cache.insert`. Wrote §9.1c. Two Flink consequences documented: `cache_blocks`
+is a per-read knob (`ReadOptions.setCacheBlocks(false)` exposed in Java — scan without polluting the working set),
+and hot keys are **cold in the cache right after every checkpoint flush / rescale clone** (§18.2) until re-read —
+`Db.warmSst`/`evictCachedSst` exist to pre-warm, but the default is lazy.
+
 ---
 
 ## Final test scorecard (22 tests, all passing — laptop/MiniCluster only)
