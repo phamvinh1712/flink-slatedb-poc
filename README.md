@@ -13,7 +13,7 @@ All modules have been run and **PASS** on this machine (see "Results" below).
 | `flink-1.20-poc` | Flink **1.20** design claims: §3 KeyGroupRange reconstruction, §0 `open(Configuration)` + deprecated-but-present RuntimeContext getters, §13.5 key-group ownership partition | JDK 11 | JDK 11 (also 25) |
 | `flink-2.3-poc` | Flink **2.3** claims: §0 `open(OpenContext)`, getTaskInfo()-only, §0/§15.2 `enableAsyncState()` exists **and** is runtime-enforced | JDK 17 | JDK 17 (also 25) |
 | `slatedb-verify` | SlateDB **correctness**: §12.8/§6.6 clone-from-checkpoint exactly-once (excludes post-checkpoint writes, retains pre-checkpoint), and the **§6.3 memtable-flush finding** | **JDK 22+** only | **JDK 22+** only |
-| `flink-slatedb-e2e` | **THE compositions** (19 mains): real Flink `KeyedProcessFunction` + SlateDB in ONE JVM — clone-restore exactly-once, real checkpoint+failure+recovery, §6.4 rescale merge (savepoint §16.18 **and** retained-checkpoint §16.19), §13 hybrid tiering, §7 compaction, §4/§4.1/§12.7 parallel shard-per-bucket (P=4), shared foyer cache (§16.20), local-disk cache (§16.21), serde, TTL, fencing, metrics | **JDK 22+** | **JDK 22+** (Flink on JDK 25) |
+| `flink-slatedb-e2e` | **THE compositions** (20 mains): real Flink `KeyedProcessFunction` + SlateDB in ONE JVM — clone-restore exactly-once, real checkpoint+failure+recovery, §6.4 rescale merge (savepoint §16.18 **and** retained-checkpoint §16.19), §13 hybrid tiering, §7 compaction, §4/§4.1/§12.7 parallel shard-per-bucket (P=4), shared foyer cache (§16.20), local-disk cache (§16.21), SST compression (§16.22), serde, TTL, fencing, metrics | **JDK 22+** | **JDK 22+** (Flink on JDK 25) |
 | `slatedb-jna-j11` | §17: the Java-22 floor is a **packaging** choice — the SlateDB native lib runs on **JDK 11/17/25** via a regenerated **Kotlin/JNA** binding (real put/get + MEMTABLE flush + detached checkpoint) | JDK 11 | **JDK 11, 17, 25** |
 
 `slatedb-verify` and `flink-slatedb-e2e` require **JDK 22+ by necessity**: `io.slatedb:slatedb-uniffi:0.14.1`
@@ -118,6 +118,7 @@ flink-slatedb-e2e  → E2E PASSED ✅  (real Flink keyed op + SlateDB + exactly-
                      RESCALE+CHECKPOINT PASSED ✅  (§16.19 REAL Flink RETAINED-CHECKPOINT→P2→P4→P1 rescale, NO savepoint; SlateDB union/projection; exactly-once, every key=9)
                      SHARED-FOYER-CACHE PASSED ✅  (§16.20 one FoyerCache backs 4 DBs; same keys/diff values → each reads its own; scope_id collision-safe)
                      DISK-CACHE PASSED ✅  (§16.21 object_store_cache_options.root_folder from Java → 768 SST cache files on local SSD; reads correct)
+                     COMPRESSION PASSED ✅  (§16.22 default OFF; Zstd shrinks SST bytes 10.24× on 'S3'; codec per-SST + self-describing → switching never breaks old files)
                      METRICS PASSED ✅  (§19 DefaultMetricsRecorder captured 43 metric names/125 series; real catalog + Flink wiring)
 slatedb-jna-j11    → JNA BINDING PASSED ✅  (§17 FALLBACK-ONLY — for platforms hard-pinned to JDK 11/17; not needed if you can run JDK 22+)
 ```
@@ -1781,6 +1782,23 @@ The test pointed `root_folder` at a temp dir, wrote+flushed 6 rounds of SSTs, re
 - **D.** reads correct through the disk-cached path (`k0=val-0-0`). ✅
 
 So the answer to "put SlateDB's cache on local SSD from Java" is `object_store_cache_options.root_folder`, subject to the §9A cautions (16 GiB **per-DB** default cap, so set `max_cache_size_bytes` explicitly; soft cap driven by an hourly `scan_interval`; contends with RocksDB/Flink tmp on a shared volume).
+
+### 16.22 SST COMPRESSION on the object store — default OFF, switchable without breaking old files (`SlateDbCompressionE2E`)
+
+**Questions answered:** *"Does SlateDB compress data on S3?"* and *"If I change the codec, does it break existing files?"*
+
+SlateDB compresses each SST's data/index/filter blocks before the SST object is PUT to the store (`slatedb/src/format/sst.rs::compress_and_transform`). Four codecs are compiled into the 0.14.1 JAR (`slatedb-uniffi` pulls slatedb with `features = ["all"]`): Snappy, Zlib, Lz4, Zstd. The default is `None` (OFF). There is no dedicated Java setter; use the generic JSON `Settings` path, which deserializes through serde and so wants the **PascalCase** variant name:
+```java
+settings.set("compression_codec", "\"Zstd\"");   // or "Snappy" / "Lz4" / "Zlib" — NOT lowercase
+```
+The test verified:
+- **Q1.** Default `compression_codec` is `null` (OFF). ✅
+- **Q1.** With Zstd set, the `.sst` bytes on the store shrank **468,933 B → 45,780 B (10.24×)** on repetitive data, proving the bytes landing on "S3" are genuinely compressed. ✅
+- **Q1.** The setter accepts `"Zstd"`/`"Snappy"` (PascalCase), not `"zstd"`/`"snappy"` — the lowercase form is the TOML/`FromStr` path, not the JSON one. ✅
+- **Q2.** SSTs written under Zstd read back correctly after reopening the writer as Snappy (0 mismatches). ✅
+- **Q2.** A mixed DB (a Zstd batch + a Snappy batch) read back correctly after reopening with compression OFF (0 mismatches across 200 keys). ✅
+
+The codec is **per-SST and self-describing**: each SST footer records its own `compression_codec`, and the read path decompresses with the codec baked into that SST (`sst.rs`: `let compression_codec = info.compression_codec; ... decompress(bytes, c)`), never the live setting. So switching the codec is safe: old SSTs keep their codec and stay readable, new SSTs use the new one, and compaction re-encodes old SSTs to the current codec over time. One caveat: a standalone/detached compactor should set `CompactorOptions.compression_codec` to match the writer (`config.rs:1247`).
 
 ---
 

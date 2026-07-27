@@ -564,9 +564,23 @@ flush, SST, first read of that block, `cache.insert`. Wrote §9.1c. Two Flink co
 pollute the working set), and hot keys are **cold in the cache right after every checkpoint flush / rescale
 clone** (§18.2) until re-read. `Db.warmSst`/`evictCachedSst` exist to pre-warm, but the default is lazy.
 
+**Q: "does SlateDB compress data on S3? if I change the codec, does it break existing files?"**
+Built `SlateDbCompressionE2E` (§16.22). Compression defaults to `None` (OFF), but all four codecs (Snappy, Zlib,
+Lz4, Zstd) are compiled into the 0.14.1 JAR because `slatedb-uniffi` pulls slatedb with `features = ["all"]`, and
+each is applied per data/index/filter block before the SST is PUT (`format/sst.rs::compress_and_transform`). There
+is no dedicated Java setter, so you go through the generic JSON `Settings` path, and the test pinned down a
+non-obvious detail: that path deserializes through serde on the `CompressionCodec` enum, whose variants are
+PascalCase, so it accepts `"Zstd"`/`"Snappy"` and rejects the lowercase `"zstd"` that the TOML/`FromStr` path uses.
+With Zstd set, `.sst` bytes on the store shrank 468,933 → 45,780 (10.24× on repetitive data), so yes, the bytes on
+S3 are genuinely compressed. Switching the codec is safe: each SST footer stores its own `compression_codec` and
+the read path decompresses with the codec baked into that SST (`info.compression_codec`), never the live setting, so
+old SSTs stay readable and a DB can hold a mix. Proved it: Zstd-written SSTs read fine after reopening as Snappy,
+and a mixed Zstd+Snappy DB read fine after reopening with compression off (0 mismatches). Caveat surfaced from
+source: a standalone compactor should match the writer's codec (`config.rs:1247`). Wrote §16.22.
+
 ---
 
-## Final test scorecard (22 tests, all passing, laptop/MiniCluster only)
+## Final test scorecard (23 tests, all passing, laptop/MiniCluster only)
 
 | Test | Verifies | Result |
 |---|---|---|
@@ -590,6 +604,7 @@ clone** (§18.2) until re-read. `Db.warmSst`/`evictCachedSst` exist to pre-warm,
 | `FlinkRescaleCheckpointE2E` | ⭐ §16.19 REAL Flink RETAINED-CHECKPOINT→P2→P4→P1 rescale (NO savepoint); SlateDB union/projection; exactly-once | ✅ |
 | `SlateDbSharedFoyerCacheE2E` | §16.20 one FoyerCache backs 4 DBs, same keys/diff values → each reads its own (scope_id collision-safe) | ✅ |
 | `SlateDbDiskCacheE2E` | §16.21 object_store_cache_options.root_folder from Java → 768 SST cache files on local SSD; reads correct | ✅ |
+| `SlateDbCompressionE2E` | §16.22 default OFF; Zstd shrinks SST bytes 10.24× on 'S3'; codec per-SST + self-describing → switching never breaks old files | ✅ |
 | `SlateDbMetricsE2E` | §19 DefaultMetricsRecorder captures 43 metric names / 125 series; real catalog + Flink wiring | ✅ |
 | `slatedb-jna-j11` | §17 Java-22 floor is removable — JNA binding, real ops + checkpoint on JDK 11/17/25 | ✅ |
 
